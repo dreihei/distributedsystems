@@ -23,6 +23,13 @@ from .state import ClusterState, Peer
 Handler = Callable[[Message], Awaitable[dict]]
 
 
+def _missing(payload: dict, *keys: str) -> str | None:
+    for key in keys:
+        if key not in payload:
+            return f"missing required field: {key}"
+    return None
+
+
 class DiscoveryProtocol(asyncio.DatagramProtocol):
     def __init__(self, server: "BlackjackServer") -> None:
         self.server = server
@@ -60,6 +67,7 @@ class BlackjackServer:
         self.state = ClusterState(server_id, advertised_host, server_port, client_port)
         self.election_running = False
         self._tasks: list[asyncio.Task] = []
+        self._table_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         client_server = await asyncio.start_server(self.handle_client, self.config.host, self.config.client_port)
@@ -123,74 +131,93 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.join(message.payload["player_id"], message.payload["name"])
-        await self.sync_table(table.table_id)
+        if err := _missing(message.payload, "player_id", "name"):
+            return {"error": err}
+        async with self._table_lock(table.table_id):
+            table.join(message.payload["player_id"], message.payload["name"])
+            await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
     async def client_add_bot(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.add_bot(
-            message.payload["bot_id"],
-            message.payload.get("name", message.payload["bot_id"]),
-            int(message.payload.get("amount", 50)),
-        )
-        await self.sync_table(table.table_id)
+        if err := _missing(message.payload, "bot_id"):
+            return {"error": err}
+        async with self._table_lock(table.table_id):
+            table.add_bot(
+                message.payload["bot_id"],
+                message.payload.get("name", message.payload["bot_id"]),
+                int(message.payload.get("amount", 50)),
+            )
+            await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
     async def client_place_bet(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.place_bet(message.payload["player_id"], int(message.payload["amount"]))
-        await self.sync_table(table.table_id)
+        if err := _missing(message.payload, "player_id", "amount"):
+            return {"error": err}
+        async with self._table_lock(table.table_id):
+            table.place_bet(message.payload["player_id"], int(message.payload["amount"]))
+            await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
     async def client_start_round(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.start_round()
-        await self.sync_table(table.table_id)
+        async with self._table_lock(table.table_id):
+            table.start_round()
+            await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
     async def client_new_round(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.place_bet(message.payload["player_id"], int(message.payload["amount"]))
-        table.start_round()
-        await self.sync_table(table.table_id)
+        if err := _missing(message.payload, "player_id", "amount"):
+            return {"error": err}
+        async with self._table_lock(table.table_id):
+            table.place_bet(message.payload["player_id"], int(message.payload["amount"]))
+            table.start_round()
+            await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
     async def client_hit(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        if table.phase != "playing":
-            return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
-        table.hit(message.payload["player_id"])
-        await self.sync_table(table.table_id)
+        if err := _missing(message.payload, "player_id"):
+            return {"error": err}
+        async with self._table_lock(table.table_id):
+            if table.phase != "playing":
+                return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
+            table.hit(message.payload["player_id"])
+            await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
     async def client_stand(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        if table.phase != "playing":
-            return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
-        table.stand(message.payload["player_id"])
-        await self.sync_table(table.table_id)
+        if err := _missing(message.payload, "player_id"):
+            return {"error": err}
+        async with self._table_lock(table.table_id):
+            if table.phase != "playing":
+                return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
+            table.stand(message.payload["player_id"])
+            await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
     async def peer_announce(self, message: Message) -> dict:
         self.state.upsert_peer(Peer(**message.payload))
-        return {"peer": self.state.local_peer().__dict__, "tables": self.serialized_tables()}
+        return {"peer": self.state.local_peer().to_dict(), "tables": self.serialized_tables()}
 
     async def peer_heartbeat(self, message: Message) -> dict:
         self.state.upsert_peer(Peer(**message.payload))
-        return {"peer": self.state.local_peer().__dict__}
+        return {"peer": self.state.local_peer().to_dict()}
 
     async def peer_state_sync(self, message: Message) -> dict:
         self.state.apply_snapshot(message.payload["table"])
@@ -216,7 +243,7 @@ class BlackjackServer:
             await asyncio.sleep(2.0)
 
     async def announce_to_known_ports(self) -> None:
-        payload = self.state.local_peer().__dict__
+        payload = self.state.local_peer().to_dict()
         for port in self.nearby_peer_ports():
             if port != self.config.server_port:
                 response = await self.request("localhost", port, Message("SERVER_ANNOUNCE", str(self.state.server_id), payload))
@@ -242,7 +269,7 @@ class BlackjackServer:
 
     async def send_heartbeats(self) -> None:
         for peer in list(self.state.peers.values()):
-            response = await self.request(peer.host, peer.server_port, Message("HEARTBEAT", str(self.state.server_id), self.state.local_peer().__dict__))
+            response = await self.request(peer.host, peer.server_port, Message("HEARTBEAT", str(self.state.server_id), self.state.local_peer().to_dict()))
             if response:
                 peer.touch()
 
@@ -313,6 +340,11 @@ class BlackjackServer:
 
     def is_game_master(self, table_id: str) -> bool:
         return self.state.tables[table_id].game_master_id == self.state.server_id
+
+    def _table_lock(self, table_id: str) -> asyncio.Lock:
+        if table_id not in self._table_locks:
+            self._table_locks[table_id] = asyncio.Lock()
+        return self._table_locks[table_id]
 
 
 def parse_args() -> argparse.Namespace:

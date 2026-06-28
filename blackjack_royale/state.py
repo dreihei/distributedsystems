@@ -19,6 +19,15 @@ class Peer:
     def touch(self) -> None:
         self.last_seen = time.time()
 
+    def to_dict(self) -> dict:
+        return {
+            "server_id": self.server_id,
+            "host": self.host,
+            "server_port": self.server_port,
+            "client_port": self.client_port,
+            "last_seen": self.last_seen,
+        }
+
 
 @dataclass
 class ClusterState:

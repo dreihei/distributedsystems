@@ -153,18 +153,12 @@ class Table:
         player.hand.append(self.draw())
         if is_bust(player.hand):
             player.stood = True
-            self.advance_turn()
-        self.play_bots()
-        if self.all_players_done() and self.phase == "playing":
-            self.finish_dealer()
+        self.advance_turn()
         self.bump()
 
     def stand(self, player_id: str) -> None:
         self.players[player_id].stood = True
         self.advance_turn()
-        self.play_bots()
-        if self.all_players_done() and self.phase == "playing":
-            self.finish_dealer()
         self.bump()
 
     def finish_dealer(self) -> None:
@@ -188,6 +182,9 @@ class Table:
             if score > 21:
                 outcome = "lost"
                 payout = 0
+            elif is_blackjack(player.hand) and not is_blackjack(self.dealer_hand):
+                outcome = "blackjack"
+                payout = int(player.bet * 2.5)
             elif dealer_bust or score > dealer_score:
                 outcome = "won"
                 payout = player.bet * 2
@@ -215,6 +212,7 @@ class Table:
         }
 
     def advance_turn(self) -> None:
+        self.play_bots()
         active = list(self.players.values())
         while self.current_player_index < len(active) and active[self.current_player_index].stood:
             self.current_player_index += 1
@@ -222,16 +220,11 @@ class Table:
             self.finish_dealer()
 
     def settle_bets(self) -> None:
-        dealer_score = hand_value(self.dealer_hand)
-        dealer_bust = dealer_score > 21
-        for player in self.players.values():
-            score = hand_value(player.hand)
-            won = score <= 21 and (dealer_bust or score > dealer_score)
-            pushed = score <= 21 and score == dealer_score
-            if won:
-                player.balance += player.bet
-            elif not pushed:
-                player.balance -= player.bet
+        if self.last_result is None:
+            self.last_result = self.build_result()
+        for player_id, player in self.players.items():
+            payout = self.last_result["players"][player_id]["payout"]
+            player.balance += payout - player.bet
             player.bet = 0
 
     def prepare_auto_bets(self) -> None:
