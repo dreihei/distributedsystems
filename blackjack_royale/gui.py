@@ -78,8 +78,8 @@ class BlackjackControlPanel(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title("Blackjack Royale")
-        self.geometry("1120x760")
-        self.minsize(980, 680)
+        self.geometry("1280x800")
+        self.minsize(600, 500)
 
         self.servers = {
             server_id: ServerProcess(server_id, preset["client_port"], preset["server_port"])
@@ -88,6 +88,11 @@ class BlackjackControlPanel(tk.Tk):
         self.log_queue: queue.Queue[str] = queue.Queue()
         self.action_seen_counts: dict[str, int] = {}
         self.animation_running = False
+
+        self.sidebar_visible = True
+        self.sidebar_frame: ttk.Frame | None = None
+        self.toggle_strip_frame: ttk.Frame | None = None
+        self.toggle_btn: ttk.Button | None = None
 
         self.selected_port = tk.IntVar(value=9003)
         self.server_host = tk.StringVar(value="localhost")
@@ -110,74 +115,150 @@ class BlackjackControlPanel(tk.Tk):
         self.after(200, self.drain_log_queue)
 
     def build_layout(self) -> None:
-        root = ttk.Frame(self, padding=14)
-        root.pack(fill="both", expand=True)
+        outer = ttk.Frame(self, padding=0)
+        outer.pack(fill="both", expand=True)
 
-        self.build_server_section(root)
-        self.build_status_section(root)
-        self.build_command_section(root)
-        self.build_table_section(root)
-        self.build_action_section(root)
-        self.build_gameplay_section(root)
-        self.build_output_section(root)
+        # Left sidebar (fixed 300px wide, scrollable)
+        self.sidebar_frame = ttk.Frame(outer, width=300)
+        self.sidebar_frame.pack(side="left", fill="y")
+        self.sidebar_frame.pack_propagate(False)
+        self._build_sidebar_content(self.sidebar_frame)
+
+        # Narrow toggle strip (always visible)
+        self.toggle_strip_frame = ttk.Frame(outer, width=22)
+        self.toggle_strip_frame.pack(side="left", fill="y")
+        self.toggle_strip_frame.pack_propagate(False)
+        self.toggle_btn = ttk.Button(self.toggle_strip_frame, text="◄", width=2, command=self.toggle_sidebar)
+        self.toggle_btn.pack(fill="y", expand=True)
+
+        # Right area: board + action history + log
+        main = ttk.Frame(outer)
+        main.pack(side="left", fill="both", expand=True)
+
+        board_frame = ttk.LabelFrame(main, text="Blackjack Table")
+        board_frame.pack(fill="both", expand=True)
+        self.table_canvas = tk.Canvas(board_frame, bg="#146b4a", highlightthickness=0)
+        self.table_canvas.pack(fill="both", expand=True)
+        self.draw_empty_table()
+
+        self.build_action_section(main)
+        self.build_output_section(main)
+
+    def _build_sidebar_content(self, parent: ttk.Frame) -> None:
+        scroll_canvas = tk.Canvas(parent, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=scroll_canvas.yview)
+        scroll_canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        scroll_canvas.pack(side="left", fill="both", expand=True)
+
+        inner = ttk.Frame(scroll_canvas)
+        win_id = scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        inner.bind("<Configure>", lambda e: scroll_canvas.configure(scrollregion=scroll_canvas.bbox("all")))
+        scroll_canvas.bind("<Configure>", lambda e: scroll_canvas.itemconfigure(win_id, width=e.width))
+        scroll_canvas.bind_all("<MouseWheel>", lambda e: scroll_canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        self.build_server_section(inner)
+        self.build_status_section(inner)
+        self.build_connection_section(inner)
+        self.build_player_section(inner)
+        self.build_bot_section(inner)
+        self.build_gameplay_section(inner)
+        self.build_demo_section(inner)
+
+    def toggle_sidebar(self) -> None:
+        assert self.sidebar_frame is not None
+        assert self.toggle_strip_frame is not None
+        assert self.toggle_btn is not None
+        if self.sidebar_visible:
+            self.sidebar_frame.pack_forget()
+            self.toggle_btn.configure(text="►")
+            self.sidebar_visible = False
+        else:
+            self.sidebar_frame.pack(side="left", fill="y", before=self.toggle_strip_frame)
+            self.toggle_btn.configure(text="◄")
+            self.sidebar_visible = True
 
     def build_server_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Server")
-        frame.pack(fill="x", pady=(0, 10))
+        frame = ttk.LabelFrame(parent, text="Servers")
+        frame.pack(fill="x", pady=(0, 6), padx=4)
 
         for server_id, server in self.servers.items():
-            row = ttk.Frame(frame, padding=6)
+            row = ttk.Frame(frame, padding=(4, 2))
             row.pack(fill="x")
 
-            ttk.Label(row, text=f"Server {server_id}", width=10).pack(side="left")
-            ttk.Label(row, text=f"Client {server.client_port} / Peer {server.server_port}", width=24).pack(side="left")
+            ttk.Label(row, text=f"S{server_id}", width=3).pack(side="left")
+            ttk.Label(row, text=f"{server.client_port}/{server.server_port}", width=10).pack(side="left")
 
-            status = ttk.Label(row, text="stopped", width=12)
+            status = ttk.Label(row, text="stopped", width=10)
             status.pack(side="left")
             setattr(self, f"status_{server_id}", status)
 
-            ttk.Button(row, text="Start", command=lambda sid=server_id: self.start_server(sid)).pack(side="left", padx=4)
-            ttk.Button(row, text="Stop", command=lambda sid=server_id: self.stop_server(sid)).pack(side="left", padx=4)
+            ttk.Button(row, text="Start", width=5, command=lambda sid=server_id: self.start_server(sid)).pack(side="left", padx=2)
+            ttk.Button(row, text="Stop", width=5, command=lambda sid=server_id: self.stop_server(sid)).pack(side="left", padx=2)
 
-        buttons = ttk.Frame(frame, padding=6)
+        buttons = ttk.Frame(frame, padding=(4, 4))
         buttons.pack(fill="x")
-        ttk.Button(buttons, text="Start All", command=self.start_all).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Stop All", command=self.stop_all).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Simulate Game Master Failure", command=lambda: self.stop_server(3)).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Start All", command=self.start_all).pack(side="left", padx=2)
+        ttk.Button(buttons, text="Stop All", command=self.stop_all).pack(side="left", padx=2)
+        ttk.Button(buttons, text="Fail GM", command=lambda: self.stop_server(3)).pack(side="left", padx=2)
 
-    def build_command_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Setup")
-        frame.pack(fill="x", pady=(0, 10))
+    def build_status_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Status")
+        frame.pack(fill="x", pady=(0, 6), padx=4)
 
-        form = ttk.Frame(frame, padding=6)
-        form.pack(fill="x")
-
-        self.add_entry(form, "Server-Port", self.selected_port, 0)
-        self.add_entry(form, "Server-Host", self.server_host, 1)
-        self.add_entry(form, "Table", self.table_id, 2)
-        self.add_entry(form, "Player ID", self.player_id, 3)
-        self.add_entry(form, "Name", self.player_name, 4)
-        self.add_entry(form, "Bet", self.bet_amount, 5)
-        self.add_entry(form, "Bot Name", self.bot_name, 6)
-
-        buttons = ttk.Frame(frame, padding=6)
-        buttons.pack(fill="x")
-
-        commands = [
-            ("Refresh", self.list_tables),
-            ("Discover LAN", self.discover_network_servers),
-            ("Join Table", self.join_table),
-            ("Add Bot", self.add_bot),
-            ("Place Bet", self.place_bet),
-            ("Demo Sequence", self.demo_sequence),
+        labels = [
+            self.cluster_status,
+            self.round_status,
+            self.dealer_status,
+            self.player_status,
+            self.bot_status,
         ]
-        for label, command in commands:
-            ttk.Button(buttons, text=label, command=command).pack(side="left", padx=4, pady=4)
+        for variable in labels:
+            ttk.Label(frame, textvariable=variable, anchor="w", wraplength=270).pack(
+                fill="x", padx=6, pady=1
+            )
+
+    def build_connection_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Connection")
+        frame.pack(fill="x", pady=(0, 6), padx=4)
+
+        self.add_entry(frame, "Server-Port", self.selected_port)
+        self.add_entry(frame, "Server-Host", self.server_host)
+        self.add_entry(frame, "Table", self.table_id)
+
+        buttons = ttk.Frame(frame, padding=(4, 2))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Refresh", command=self.list_tables).pack(side="left", padx=2, pady=2)
+        ttk.Button(buttons, text="Discover LAN", command=self.discover_network_servers).pack(side="left", padx=2, pady=2)
+
+    def build_player_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Player")
+        frame.pack(fill="x", pady=(0, 6), padx=4)
+
+        self.add_entry(frame, "Player ID", self.player_id)
+        self.add_entry(frame, "Name", self.player_name)
+        self.add_entry(frame, "Bet", self.bet_amount)
+
+        buttons = ttk.Frame(frame, padding=(4, 2))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Join Table", command=self.join_table).pack(side="left", padx=2, pady=2)
+        ttk.Button(buttons, text="Place Bet", command=self.place_bet).pack(side="left", padx=2, pady=2)
+
+    def build_bot_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Bot")
+        frame.pack(fill="x", pady=(0, 6), padx=4)
+
+        self.add_entry(frame, "Bot Name", self.bot_name)
+
+        buttons = ttk.Frame(frame, padding=(4, 2))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Add Bot", command=self.add_bot).pack(side="left", padx=2, pady=2)
 
     def build_gameplay_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Player Actions")
-        frame.pack(fill="x", pady=(0, 10))
-        buttons = ttk.Frame(frame, padding=6)
+        frame.pack(fill="x", pady=(0, 6), padx=4)
+        buttons = ttk.Frame(frame, padding=(4, 4))
         buttons.pack(fill="x")
         for label, command in [
             ("Start Round", self.start_round),
@@ -185,16 +266,23 @@ class BlackjackControlPanel(tk.Tk):
             ("Stand", self.stand),
         ]:
             button = ttk.Button(buttons, text=label, command=command)
-            button.pack(side="left", padx=4, pady=4)
+            button.pack(side="left", padx=2, pady=2)
             self.command_buttons[label] = button
+
+    def build_demo_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Demo")
+        frame.pack(fill="x", pady=(0, 6), padx=4)
+        buttons = ttk.Frame(frame, padding=(4, 4))
+        buttons.pack(fill="x")
+        ttk.Button(buttons, text="Demo Sequence", command=self.demo_sequence).pack(side="left", padx=2, pady=2)
 
     def build_action_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Visible Actions")
-        frame.pack(fill="x", pady=(0, 10))
-        ttk.Label(frame, textvariable=self.action_status).pack(anchor="w", padx=8, pady=6)
+        frame.pack(fill="x", pady=(4, 0))
+        ttk.Label(frame, textvariable=self.action_status).pack(anchor="w", padx=8, pady=4)
         history_frame = ttk.Frame(frame, padding=(8, 0, 8, 8))
         history_frame.pack(fill="x")
-        self.action_history = tk.Text(history_frame, height=5, wrap="word", state="disabled")
+        self.action_history = tk.Text(history_frame, height=4, wrap="word", state="disabled")
         self.action_history.pack(side="left", fill="x", expand=True)
         scrollbar = ttk.Scrollbar(history_frame, orient="vertical", command=self.action_history.yview)
         scrollbar.pack(side="right", fill="y")
@@ -202,42 +290,20 @@ class BlackjackControlPanel(tk.Tk):
 
     def build_output_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Log")
-        frame.pack(fill="both")
+        frame.pack(fill="x", pady=(4, 0))
 
-        self.output = tk.Text(frame, height=7, wrap="word")
+        self.output = tk.Text(frame, height=5, wrap="word")
         self.output.pack(side="left", fill="both", expand=True)
 
         scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.output.yview)
         scrollbar.pack(side="right", fill="y")
         self.output.configure(yscrollcommand=scrollbar.set)
 
-    def build_table_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Blackjack Table")
-        frame.pack(fill="both", expand=True, pady=(0, 10))
-
-        self.table_canvas = tk.Canvas(frame, height=360, bg="#146b4a", highlightthickness=0)
-        self.table_canvas.pack(fill="both", expand=True)
-        self.draw_empty_table()
-
-    def build_status_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Server and Cluster")
-        frame.pack(fill="x", pady=(0, 10))
-
-        labels = [
-            (self.cluster_status, 44),
-            (self.round_status, 30),
-            (self.dealer_status, 26),
-            (self.player_status, 36),
-            (self.bot_status, 46),
-        ]
-        for variable, width in labels:
-            ttk.Label(frame, textvariable=variable, width=width).pack(side="left", padx=8, pady=8)
-
-    def add_entry(self, parent: ttk.Frame, label: str, variable: tk.Variable, column: int) -> None:
+    def add_entry(self, parent: ttk.Frame, label: str, variable: tk.Variable) -> None:
         cell = ttk.Frame(parent)
-        cell.grid(row=0, column=column, padx=5, sticky="ew")
+        cell.pack(fill="x", padx=6, pady=2)
         ttk.Label(cell, text=label).pack(anchor="w")
-        ttk.Entry(cell, textvariable=variable, width=16).pack(fill="x")
+        ttk.Entry(cell, textvariable=variable, width=20).pack(fill="x")
 
     def start_server(self, server_id: int) -> None:
         server = self.servers[server_id]
@@ -570,7 +636,7 @@ class BlackjackControlPanel(tk.Tk):
 
     def update_status_labels(self, table: dict[str, Any]) -> None:
         self.cluster_status.set(
-            f"Cluster: host {self.server_host.get()} | selected port {self.selected_port.get()} | GM {table['game_master_id']} | version {table.get('state_version', 0)}"
+            f"Cluster: host {self.server_host.get()} | port {self.selected_port.get()} | GM {table['game_master_id']} | v{table.get('state_version', 0)}"
         )
         self.round_status.set(f"Round: {table['phase']} | GM {table['game_master_id']}")
         self.dealer_status.set(
