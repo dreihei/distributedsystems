@@ -110,6 +110,11 @@ class BlackjackControlPanel(tk.Tk):
         self.command_buttons: dict[str, ttk.Button] = {}
         self.action_history: tk.Text | None = None
 
+        self.known_tables: dict[str, dict] = {}
+        self.tables_panel_visible = True
+        self.tables_panel_content: ttk.Frame | None = None
+        self.tables_toggle_btn: ttk.Button | None = None
+
         self.build_layout()
         self.after(500, self.refresh_status)
         self.after(200, self.drain_log_queue)
@@ -160,6 +165,7 @@ class BlackjackControlPanel(tk.Tk):
 
         self.build_server_section(inner)
         self.build_status_section(inner)
+        self.build_tables_section(inner)
         self.build_connection_section(inner)
         self.build_player_section(inner)
         self.build_bot_section(inner)
@@ -202,6 +208,64 @@ class BlackjackControlPanel(tk.Tk):
         ttk.Button(buttons, text="Start All", command=self.start_all).pack(side="left", padx=2)
         ttk.Button(buttons, text="Stop All", command=self.stop_all).pack(side="left", padx=2)
         ttk.Button(buttons, text="Fail GM", command=lambda: self.stop_server(3)).pack(side="left", padx=2)
+
+    def build_tables_section(self, parent: ttk.Frame) -> None:
+        outer = ttk.Frame(parent)
+        outer.pack(fill="x", pady=(0, 6), padx=4)
+
+        header = ttk.Frame(outer)
+        header.pack(fill="x")
+        ttk.Label(header, text="Tables", font=("Segoe UI", 9, "bold")).pack(side="left", padx=4, pady=4)
+        self.tables_toggle_btn = ttk.Button(header, text="▲", width=2, command=self.toggle_tables_panel)
+        self.tables_toggle_btn.pack(side="right", padx=4)
+
+        self.tables_panel_content = ttk.Frame(outer)
+        self.tables_panel_content.pack(fill="x")
+        ttk.Label(self.tables_panel_content, text="No tables — click Refresh", foreground="#888888").pack(
+            anchor="w", padx=6, pady=2
+        )
+
+    def toggle_tables_panel(self) -> None:
+        assert self.tables_panel_content is not None
+        assert self.tables_toggle_btn is not None
+        if self.tables_panel_visible:
+            self.tables_panel_content.pack_forget()
+            self.tables_toggle_btn.configure(text="▼")
+            self.tables_panel_visible = False
+        else:
+            self.tables_panel_content.pack(fill="x")
+            self.tables_toggle_btn.configure(text="▲")
+            self.tables_panel_visible = True
+
+    def update_tables_panel(self, tables: list[dict]) -> None:
+        for table in tables:
+            self.known_tables[table["table_id"]] = table
+        if self.tables_panel_content is None:
+            return
+        for child in self.tables_panel_content.winfo_children():
+            child.destroy()
+        if not self.known_tables:
+            ttk.Label(self.tables_panel_content, text="No tables", foreground="#888888").pack(
+                anchor="w", padx=6, pady=2
+            )
+            return
+        for tid, table in self.known_tables.items():
+            phase = table.get("phase", "?")
+            n_players = len(table.get("players", {}))
+            gm = table.get("game_master_id", "?")
+            is_active = tid == self.table_id.get()
+            label = f"{'▶ ' if is_active else '  '}{tid}  {phase}  {n_players}p  GM{gm}"
+            btn = ttk.Button(
+                self.tables_panel_content,
+                text=label,
+                command=lambda t=table: self.switch_to_table(t),
+            )
+            btn.pack(fill="x", padx=2, pady=1)
+
+    def switch_to_table(self, table: dict) -> None:
+        self.table_id.set(table["table_id"])
+        self.draw_table(table)
+        self.update_tables_panel([])
 
     def build_status_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Status")
@@ -488,6 +552,8 @@ class BlackjackControlPanel(tk.Tk):
                 self.draw_table(item[1])
             elif isinstance(item, tuple) and item[0] == "ANIMATE":
                 self.play_action_sequence(item[1], item[2])
+            elif isinstance(item, tuple) and item[0] == "UPDATE_TABLES":
+                self.update_tables_panel(item[1])
             else:
                 self.log(item)
         self.after(200, self.drain_log_queue)
@@ -497,8 +563,13 @@ class BlackjackControlPanel(tk.Tk):
         self.output.see("end")
 
     def queue_table_draw(self, response: dict, message_type: str) -> None:
+        all_tables = response.get("tables", [])
+        if all_tables:
+            self.log_queue.put(("UPDATE_TABLES", all_tables))
+
         table = self.extract_table(response)
         if table:
+            self.log_queue.put(("UPDATE_TABLES", [table]))
             actions = self.new_actions(table)
             animated_messages = {"START_ROUND", "HIT", "STAND", "NEW_ROUND"}
             if actions and message_type in animated_messages:
