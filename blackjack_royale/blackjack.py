@@ -109,6 +109,7 @@ class Table:
     state_version: int = 0
     last_result: dict | None = None
     dealer_action: str = "waiting"
+    action_log: list[dict] = field(default_factory=list)
 
     def join(self, player_id: str, name: str, is_bot: bool = False) -> Player:
         player = self.players.get(player_id)
@@ -127,7 +128,16 @@ class Table:
         player.default_bet = amount
         self.bump()
 
-    def add_bot(self, bot_id: str, name: str, default_bet: int = 50) -> Player:
+    def next_bot_id(self) -> str:
+        index = 1
+        while f"bot{index}" in self.players:
+            index += 1
+        return f"bot{index}"
+
+    def add_bot(self, bot_id: str | None = None, name: str = "Bot", default_bet: int = 50) -> Player:
+        bot_id = bot_id or self.next_bot_id()
+        if bot_id in self.players and not self.players[bot_id].is_bot:
+            bot_id = self.next_bot_id()
         bot = self.join(bot_id, name, is_bot=True)
         bot.default_bet = default_bet
         if bot.bet == 0 and bot.balance > 0:
@@ -137,6 +147,8 @@ class Table:
     def start_round(self, auto_bets: bool = False) -> None:
         self.phase = "playing"
         self.deck = new_deck()
+        self.action_log = []
+        self.last_result = None
         self.dealer_hand = [self.draw(), self.draw()]
         if auto_bets:
             self.prepare_auto_bets()
@@ -145,14 +157,18 @@ class Table:
             player.stood = False
         self.current_player_index = 0
         self.dealer_action = "waiting for players"
+        self.record_action("round", "Round started")
         self.play_bots()
         self.bump()
 
     def hit(self, player_id: str) -> None:
         player = self.players[player_id]
-        player.hand.append(self.draw())
+        card = self.draw()
+        player.hand.append(card)
+        self.record_player_action(player, "draw", card)
         if is_bust(player.hand):
             player.stood = True
+            self.record_player_action(player, "bust")
             self.advance_turn()
         self.play_bots()
         if self.all_players_done() and self.phase == "playing":
@@ -160,7 +176,9 @@ class Table:
         self.bump()
 
     def stand(self, player_id: str) -> None:
-        self.players[player_id].stood = True
+        player = self.players[player_id]
+        player.stood = True
+        self.record_player_action(player, "stand")
         self.advance_turn()
         self.play_bots()
         if self.all_players_done() and self.phase == "playing":
@@ -169,14 +187,15 @@ class Table:
 
     def finish_dealer(self) -> None:
         self.dealer_action = "drawing"
-        while hand_value(self.dealer_hand) < 17:
-            self.dealer_hand.append(self.draw())
+        while hand_value(self.dealer_hand) < 18:
+            card = self.draw()
+            self.dealer_hand.append(card)
+            self.record_dealer_action("draw", card)
         self.dealer_action = "stand" if hand_value(self.dealer_hand) <= 21 else "bust"
+        self.record_dealer_action(self.dealer_action)
         self.phase = "finished"
         self.last_result = self.build_result()
         self.settle_bets()
-        if self.has_human_players_with_money():
-            self.start_round(auto_bets=True)
         self.bump()
 
     def build_result(self) -> dict:
@@ -250,7 +269,11 @@ class Table:
             if not player.is_bot or player.stood:
                 continue
             while hand_value(player.hand) < 16:
-                player.hand.append(self.draw())
+                card = self.draw()
+                player.hand.append(card)
+                self.record_player_action(player, "draw", card)
+            action = "bust" if is_bust(player.hand) else "stand"
+            self.record_player_action(player, action)
             player.stood = True
 
     def current_player(self) -> Player | None:
@@ -270,19 +293,68 @@ class Table:
             self.deck = new_deck()
         return self.deck.pop()
 
+    def record_player_action(self, player: Player, action: str, card: Card | None = None) -> None:
+        actor = "bot" if player.is_bot else "player"
+        value = hand_value(player.hand)
+        self.action_log.append(
+            {
+                "actor": actor,
+                "player_id": player.player_id,
+                "name": player.name,
+                "action": action,
+                "card": card.label() if card else None,
+                "hand": [item.label() for item in player.hand],
+                "value": value,
+                "bust": value > 21,
+                "message": self.action_message(actor, player.name, action, card, value),
+            }
+        )
+
+    def record_dealer_action(self, action: str, card: Card | None = None) -> None:
+        value = hand_value(self.dealer_hand)
+        self.action_log.append(
+            {
+                "actor": "dealer",
+                "player_id": "dealer",
+                "name": "Dealer",
+                "action": action,
+                "card": card.label() if card else None,
+                "hand": [item.label() for item in self.dealer_hand],
+                "value": value,
+                "bust": value > 21,
+                "message": self.action_message("dealer", "Dealer", action, card, value),
+            }
+        )
+
+    def record_action(self, actor: str, message: str) -> None:
+        self.action_log.append({"actor": actor, "action": "info", "message": message})
+
+    def action_message(self, actor: str, name: str, action: str, card: Card | None, value: int) -> str:
+        label = "Dealer" if actor == "dealer" else name
+        if action == "draw" and card:
+            return f"{label} draws {card.label()} and now has {value}"
+        if action == "stand":
+            return f"{label} stands on {value}"
+        if action == "bust":
+            return f"{label} busts with {value}"
+        return f"{label}: {action} ({value})"
+
     def bump(self) -> None:
         self.state_version += 1
 
     def snapshot(self) -> dict:
+        current = self.current_player()
         return {
             "table_id": self.table_id,
             "game_master_id": self.game_master_id,
             "phase": self.phase,
             "state_version": self.state_version,
+            "current_player_id": current.player_id if current and self.phase == "playing" else None,
             "dealer_hand": [card.label() for card in self.dealer_hand],
             "dealer_value": hand_value(self.dealer_hand),
             "dealer_action": self.dealer_action,
             "last_result": self.last_result,
+            "action_log": self.action_log,
             "players": {
                 pid: {
                     "name": player.name,
@@ -311,6 +383,7 @@ class Table:
             "state_version": self.state_version,
             "last_result": self.last_result,
             "dealer_action": self.dealer_action,
+            "action_log": self.action_log,
         }
 
     @staticmethod
@@ -324,4 +397,5 @@ class Table:
         table.state_version = raw["state_version"]
         table.last_result = raw.get("last_result")
         table.dealer_action = raw.get("dealer_action", "waiting")
+        table.action_log = raw.get("action_log", [])
         return table

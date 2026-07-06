@@ -26,7 +26,7 @@ class BlackjackRulesTest(unittest.TestCase):
         self.assertEqual(restored.players["p1"].name, "Sergej")
         self.assertEqual(len(restored.players["p1"].hand), 2)
 
-    def test_finished_round_starts_next_round_automatically(self) -> None:
+    def test_finished_round_waits_for_manual_next_round(self) -> None:
         table = Table(table_id="main", game_master_id=3)
         table.join("p1", "Sergej")
         table.place_bet("p1", 50)
@@ -34,22 +34,30 @@ class BlackjackRulesTest(unittest.TestCase):
 
         table.stand("p1")
 
-        self.assertEqual(table.phase, "playing")
-        self.assertEqual(table.players["p1"].bet, 50)
-        self.assertEqual(len(table.players["p1"].hand), 2)
-        self.assertEqual(len(table.dealer_hand), 2)
+        self.assertEqual(table.phase, "finished")
+        self.assertEqual(table.players["p1"].bet, 0)
         self.assertIsNotNone(table.last_result)
-        self.assertGreaterEqual(table.last_result["dealer_value"], 17)
+        self.assertGreaterEqual(table.last_result["dealer_value"], 18)
 
     def test_bot_can_join_table(self) -> None:
         table = Table(table_id="main", game_master_id=3)
 
-        table.add_bot("bot1", "DealerBot", 25)
+        table.add_bot(None, "DealerBot", 25)
 
         self.assertTrue(table.players["bot1"].is_bot)
         self.assertEqual(table.players["bot1"].default_bet, 25)
         self.assertEqual(table.players["bot1"].bet, 25)
         self.assertEqual(table.players["bot1"].balance, 1000)
+
+    def test_bot_ids_are_assigned_sequentially(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+
+        first = table.add_bot(None, "DealerBot", 25)
+        second = table.add_bot(None, "DealerBot", 25)
+
+        self.assertEqual(first.player_id, "bot1")
+        self.assertEqual(second.player_id, "bot2")
+        self.assertEqual(len(table.players), 2)
 
     def test_balance_increases_when_player_wins(self) -> None:
         table = Table(table_id="main", game_master_id=3)
@@ -88,14 +96,14 @@ class BlackjackRulesTest(unittest.TestCase):
         self.assertGreaterEqual(hand_value(bot.hand), 16)
         self.assertTrue(bot.stood)
 
-    def test_dealer_draws_until_17_then_stands(self) -> None:
+    def test_dealer_draws_until_18_then_stands(self) -> None:
         table = Table(table_id="main", game_master_id=3)
         table.dealer_hand = [Card("5", "clubs"), Card("6", "spades")]
-        table.deck = [Card("2", "hearts"), Card("K", "diamonds")]
+        table.deck = [Card("K", "diamonds"), Card("7", "hearts")]
 
         table.finish_dealer()
 
-        self.assertGreaterEqual(table.last_result["dealer_value"], 17)
+        self.assertGreaterEqual(table.last_result["dealer_value"], 18)
         self.assertIn(table.last_result["dealer_action"], {"stand", "bust"})
 
 

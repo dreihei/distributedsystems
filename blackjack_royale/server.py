@@ -131,11 +131,8 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.add_bot(
-            message.payload["bot_id"],
-            message.payload.get("name", message.payload["bot_id"]),
-            int(message.payload.get("amount", 50)),
-        )
+        bot_name = message.payload.get("name") or "Bot"
+        table.add_bot(None, bot_name, int(message.payload.get("amount", 50)))
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -330,7 +327,14 @@ def main() -> None:
     discovery_port = args.discovery_port or 9200 + args.id
     server = BlackjackServer(args.id, args.host, args.client_port, args.server_port, discovery_port)
     with contextlib.suppress(KeyboardInterrupt):
-        asyncio.run(server.start())
+        try:
+            asyncio.run(server.start())
+        except OSError as exc:
+            print(
+                f"server {args.id} could not start: port already in use or unavailable "
+                f"(client={args.client_port}, peer={args.server_port}, discovery={discovery_port}): {exc}",
+                flush=True,
+            )
 
 
 if __name__ == "__main__":

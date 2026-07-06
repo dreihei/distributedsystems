@@ -40,7 +40,7 @@ def parse_args() -> argparse.Namespace:
     join.add_argument("--name", required=True)
 
     bot = sub.add_parser("add-bot")
-    bot.add_argument("--bot-id", required=True)
+    bot.add_argument("--bot-id")
     bot.add_argument("--name", default="Bot")
     bot.add_argument("--amount", type=int, default=50)
 
@@ -69,7 +69,10 @@ def to_message(args: argparse.Namespace) -> tuple[str, dict]:
     builders = {
         "tables": lambda: ("LIST_TABLES", base),
         "join": lambda: ("JOIN_TABLE", base | {"player_id": args.player_id, "name": args.name}),
-        "add-bot": lambda: ("ADD_BOT", base | {"bot_id": args.bot_id, "name": args.name, "amount": args.amount}),
+        "add-bot": lambda: (
+            "ADD_BOT",
+            base | {"name": args.name, "amount": args.amount} | ({"bot_id": args.bot_id} if args.bot_id else {}),
+        ),
         "bet": lambda: ("PLACE_BET", base | {"player_id": args.player_id, "amount": args.amount}),
         "start": lambda: ("START_ROUND", base | {"player_id": args.player_id}),
         "new-round": lambda: ("NEW_ROUND", base | {"player_id": args.player_id, "amount": args.amount}),

@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import queue
+import socket
 import subprocess
 import sys
 import threading
 import time
 import asyncio
 import tkinter as tk
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from typing import Any
 
 from .client import send
@@ -22,6 +23,7 @@ SERVER_PRESETS = {
     2: {"client_port": 9002, "server_port": 9102},
     3: {"client_port": 9003, "server_port": 9103},
 }
+ACTION_REPLAY_DELAY_MS = 1800
 
 
 class ServerProcess:
@@ -29,6 +31,7 @@ class ServerProcess:
         self.server_id = server_id
         self.client_port = client_port
         self.server_port = server_port
+        self.discovery_port = 9200 + server_id
         self.process: subprocess.Popen | None = None
 
     def start(self) -> None:
@@ -66,6 +69,10 @@ class ServerProcess:
     def is_running(self) -> bool:
         return self.process is not None and self.process.poll() is None
 
+    def cleanup_finished_process(self) -> None:
+        if self.process is not None and self.process.poll() is not None:
+            self.process = None
+
 
 class BlackjackControlPanel(tk.Tk):
     def __init__(self) -> None:
@@ -79,19 +86,24 @@ class BlackjackControlPanel(tk.Tk):
             for server_id, preset in SERVER_PRESETS.items()
         }
         self.log_queue: queue.Queue[str] = queue.Queue()
+        self.action_seen_counts: dict[str, int] = {}
+        self.animation_running = False
 
         self.selected_port = tk.IntVar(value=9003)
         self.server_host = tk.StringVar(value="localhost")
         self.player_id = tk.StringVar(value="p1")
         self.player_name = tk.StringVar(value="Sergej")
-        self.bot_id = tk.StringVar(value="bot1")
         self.bot_name = tk.StringVar(value="DealerBot")
         self.bet_amount = tk.IntVar(value=50)
         self.table_id = tk.StringVar(value="main")
+        self.cluster_status = tk.StringVar(value="Cluster: no table loaded")
         self.dealer_status = tk.StringVar(value="Dealer: -")
         self.player_status = tk.StringVar(value="You: -")
         self.bot_status = tk.StringVar(value="Bots: -")
         self.round_status = tk.StringVar(value="Round: no table loaded")
+        self.action_status = tk.StringVar(value="Actions: waiting")
+        self.command_buttons: dict[str, ttk.Button] = {}
+        self.action_history: tk.Text | None = None
 
         self.build_layout()
         self.after(500, self.refresh_status)
@@ -102,9 +114,11 @@ class BlackjackControlPanel(tk.Tk):
         root.pack(fill="both", expand=True)
 
         self.build_server_section(root)
-        self.build_command_section(root)
         self.build_status_section(root)
+        self.build_command_section(root)
         self.build_table_section(root)
+        self.build_action_section(root)
+        self.build_gameplay_section(root)
         self.build_output_section(root)
 
     def build_server_section(self, parent: ttk.Frame) -> None:
@@ -132,7 +146,7 @@ class BlackjackControlPanel(tk.Tk):
         ttk.Button(buttons, text="Simulate Game Master Failure", command=lambda: self.stop_server(3)).pack(side="left", padx=4)
 
     def build_command_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Spiel")
+        frame = ttk.LabelFrame(parent, text="Setup")
         frame.pack(fill="x", pady=(0, 10))
 
         form = ttk.Frame(frame, padding=6)
@@ -144,8 +158,7 @@ class BlackjackControlPanel(tk.Tk):
         self.add_entry(form, "Player ID", self.player_id, 3)
         self.add_entry(form, "Name", self.player_name, 4)
         self.add_entry(form, "Bet", self.bet_amount, 5)
-        self.add_entry(form, "Bot ID", self.bot_id, 6)
-        self.add_entry(form, "Bot Name", self.bot_name, 7)
+        self.add_entry(form, "Bot Name", self.bot_name, 6)
 
         buttons = ttk.Frame(frame, padding=6)
         buttons.pack(fill="x")
@@ -156,13 +169,36 @@ class BlackjackControlPanel(tk.Tk):
             ("Join Table", self.join_table),
             ("Add Bot", self.add_bot),
             ("Place Bet", self.place_bet),
-            ("Start Round", self.start_round),
-            ("Hit", self.hit),
-            ("Stand", self.stand),
             ("Demo Sequence", self.demo_sequence),
         ]
         for label, command in commands:
             ttk.Button(buttons, text=label, command=command).pack(side="left", padx=4, pady=4)
+
+    def build_gameplay_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Player Actions")
+        frame.pack(fill="x", pady=(0, 10))
+        buttons = ttk.Frame(frame, padding=6)
+        buttons.pack(fill="x")
+        for label, command in [
+            ("Start Round", self.start_round),
+            ("Hit", self.hit),
+            ("Stand", self.stand),
+        ]:
+            button = ttk.Button(buttons, text=label, command=command)
+            button.pack(side="left", padx=4, pady=4)
+            self.command_buttons[label] = button
+
+    def build_action_section(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Visible Actions")
+        frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(frame, textvariable=self.action_status).pack(anchor="w", padx=8, pady=6)
+        history_frame = ttk.Frame(frame, padding=(8, 0, 8, 8))
+        history_frame.pack(fill="x")
+        self.action_history = tk.Text(history_frame, height=5, wrap="word", state="disabled")
+        self.action_history.pack(side="left", fill="x", expand=True)
+        scrollbar = ttk.Scrollbar(history_frame, orient="vertical", command=self.action_history.yview)
+        scrollbar.pack(side="right", fill="y")
+        self.action_history.configure(yscrollcommand=scrollbar.set)
 
     def build_output_section(self, parent: ttk.Frame) -> None:
         frame = ttk.LabelFrame(parent, text="Log")
@@ -184,10 +220,11 @@ class BlackjackControlPanel(tk.Tk):
         self.draw_empty_table()
 
     def build_status_section(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Aktueller Stand")
+        frame = ttk.LabelFrame(parent, text="Server and Cluster")
         frame.pack(fill="x", pady=(0, 10))
 
         labels = [
+            (self.cluster_status, 44),
             (self.round_status, 30),
             (self.dealer_status, 26),
             (self.player_status, 36),
@@ -203,13 +240,56 @@ class BlackjackControlPanel(tk.Tk):
         ttk.Entry(cell, textvariable=variable, width=16).pack(fill="x")
 
     def start_server(self, server_id: int) -> None:
-        self.servers[server_id].start()
+        server = self.servers[server_id]
+        server.cleanup_finished_process()
+        blocked = self.blocked_server_ports(server)
+        if blocked:
+            self.log(
+                f"server {server_id} is already reachable or its port(s) are in use: {', '.join(blocked)}. "
+                "Using it as an external server if it responds to game commands."
+            )
+            return
+        server.start()
         self.watch_server_output(server_id)
         self.log(f"started server {server_id}")
 
     def stop_server(self, server_id: int) -> None:
-        self.servers[server_id].stop()
+        server = self.servers[server_id]
+        if not server.is_running() and self.server_ports_in_use(server):
+            self.log(f"server {server_id} is running outside this GUI; stop that process from its terminal or task manager")
+            return
+        server.stop()
         self.log(f"stopped server {server_id}")
+
+    def blocked_server_ports(self, server: ServerProcess) -> list[str]:
+        blocked = []
+        if not self.tcp_port_available(server.client_port):
+            blocked.append(f"client {server.client_port}")
+        if not self.tcp_port_available(server.server_port):
+            blocked.append(f"peer {server.server_port}")
+        if not self.udp_port_available(server.discovery_port):
+            blocked.append(f"discovery {server.discovery_port}")
+        return blocked
+
+    def tcp_port_available(self, port: int) -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.bind(("", port))
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
+
+    def udp_port_available(self, port: int) -> bool:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("", port))
+            return True
+        except OSError:
+            return False
+        finally:
+            sock.close()
 
     def start_all(self) -> None:
         for server_id in self.servers:
@@ -247,7 +327,6 @@ class BlackjackControlPanel(tk.Tk):
     def add_bot(self) -> None:
         payload = {
             "table_id": self.table_id.get(),
-            "bot_id": self.bot_id.get(),
             "name": self.bot_name.get(),
             "amount": self.bet_amount.get(),
         }
@@ -290,7 +369,7 @@ class BlackjackControlPanel(tk.Tk):
         try:
             response = asyncio.run(send(self.server_host.get(), ports[0], message_type, payload))
             formatted = json.dumps(response, indent=2)
-            self.queue_table_draw(response)
+            self.queue_table_draw(response, message_type)
             self.log_queue.put(f"> {message_type} on port {ports[0]}\n{formatted}")
         except OSError as exc:
             self.try_fallback_ports(message_type, payload, ports[1:], exc)
@@ -300,7 +379,7 @@ class BlackjackControlPanel(tk.Tk):
         running_ports = [
             server.client_port
             for server in sorted(self.servers.values(), key=lambda item: item.server_id, reverse=True)
-            if server.is_running()
+            if server.is_running() or self.server_ports_in_use(server)
         ]
         return [selected, *[port for port in running_ports if port != selected]]
 
@@ -310,7 +389,7 @@ class BlackjackControlPanel(tk.Tk):
                 response = asyncio.run(send(self.server_host.get(), port, message_type, payload))
                 formatted = json.dumps(response, indent=2)
                 self.selected_port.set(port)
-                self.queue_table_draw(response)
+                self.queue_table_draw(response, message_type)
                 self.log_queue.put(f"> {message_type} on fallback port {port}\n{formatted}")
                 return
             except OSError:
@@ -323,14 +402,26 @@ class BlackjackControlPanel(tk.Tk):
     def refresh_status(self) -> None:
         for server_id, server in self.servers.items():
             status = getattr(self, f"status_{server_id}")
-            status.configure(text="running" if server.is_running() else "stopped")
+            status.configure(text=self.server_status_text(server))
         self.after(500, self.refresh_status)
+
+    def server_status_text(self, server: ServerProcess) -> str:
+        if server.is_running():
+            return "running"
+        if self.server_ports_in_use(server):
+            return "running ext"
+        return "stopped"
+
+    def server_ports_in_use(self, server: ServerProcess) -> bool:
+        return not self.tcp_port_available(server.client_port) or not self.tcp_port_available(server.server_port)
 
     def drain_log_queue(self) -> None:
         while not self.log_queue.empty():
             item = self.log_queue.get()
             if isinstance(item, tuple) and item[0] == "DRAW":
                 self.draw_table(item[1])
+            elif isinstance(item, tuple) and item[0] == "ANIMATE":
+                self.play_action_sequence(item[1], item[2])
             else:
                 self.log(item)
         self.after(200, self.drain_log_queue)
@@ -339,10 +430,86 @@ class BlackjackControlPanel(tk.Tk):
         self.output.insert("end", text + "\n\n")
         self.output.see("end")
 
-    def queue_table_draw(self, response: dict) -> None:
+    def queue_table_draw(self, response: dict, message_type: str) -> None:
         table = self.extract_table(response)
         if table:
-            self.log_queue.put(("DRAW", table))
+            actions = self.new_actions(table)
+            animated_messages = {"START_ROUND", "HIT", "STAND", "NEW_ROUND"}
+            if actions and message_type in animated_messages:
+                self.log_queue.put(("ANIMATE", table, actions))
+            else:
+                self.log_queue.put(("DRAW", table))
+
+    def new_actions(self, table: dict[str, Any]) -> list[dict[str, Any]]:
+        table_id = table.get("table_id", "main")
+        action_log = table.get("action_log", [])
+        seen = self.action_seen_counts.get(table_id, 0)
+        if len(action_log) < seen:
+            seen = 0
+            self.append_action_history("--- New round ---")
+        self.action_seen_counts[table_id] = len(action_log)
+        return action_log[seen:]
+
+    def append_action_history(self, message: str) -> None:
+        if self.action_history is None:
+            return
+        self.action_history.configure(state="normal")
+        self.action_history.insert("end", message + "\n")
+        self.action_history.see("end")
+        self.action_history.configure(state="disabled")
+
+    def set_gameplay_buttons_enabled(self, enabled: bool) -> None:
+        state = "normal" if enabled and not self.animation_running else "disabled"
+        for button in self.command_buttons.values():
+            button.configure(state=state)
+
+    def play_action_sequence(self, table: dict[str, Any], actions: list[dict[str, Any]]) -> None:
+        self.animation_running = True
+        self.set_gameplay_buttons_enabled(False)
+        self.draw_table(table, show_result=False)
+        self.play_action_step(table, actions, 0)
+
+    def play_action_step(self, table: dict[str, Any], actions: list[dict[str, Any]], index: int) -> None:
+        if index >= len(actions):
+            self.animation_running = False
+            self.draw_table(table, show_result=True)
+            self.action_status.set("Actions: completed")
+            self.set_gameplay_buttons_enabled(table.get("phase") != "finished")
+            if table.get("phase") == "finished" and table.get("last_result"):
+                self.show_next_round_popup()
+            return
+        action = actions[index]
+        message = action.get("message", "updated")
+        self.action_status.set("Actions: " + message)
+        self.append_action_history(message)
+        self.draw_table(self.table_for_action(table, action), show_result=False)
+        self.after(ACTION_REPLAY_DELAY_MS, lambda: self.play_action_step(table, actions, index + 1))
+
+    def table_for_action(self, table: dict[str, Any], action: dict[str, Any]) -> dict[str, Any]:
+        visible = json.loads(json.dumps(table))
+        visible["last_result"] = None
+        actor = action.get("actor")
+        hand = action.get("hand")
+        value = action.get("value")
+        if actor == "dealer" and hand is not None:
+            visible["current_player_id"] = "dealer"
+            visible["dealer_hand"] = hand
+            visible["dealer_value"] = value
+            visible["dealer_action"] = action.get("action", "drawing")
+        elif actor in {"bot", "player"} and hand is not None:
+            visible["current_player_id"] = action.get("player_id")
+            player = visible.get("players", {}).get(action.get("player_id"))
+            if player:
+                player["hand"] = hand
+                player["value"] = value
+                player["stood"] = action.get("action") in {"stand", "bust"}
+        return visible
+
+    def show_next_round_popup(self) -> None:
+        if messagebox.askyesno("Round finished", "Round finished. Start Next Round?"):
+            self.new_round()
+        else:
+            self.set_gameplay_buttons_enabled(True)
 
     def extract_table(self, response: dict) -> dict | None:
         if "table" in response:
@@ -354,7 +521,7 @@ class BlackjackControlPanel(tk.Tk):
         self.table_canvas.delete("all")
         self.table_canvas.create_text(490, 135, text="No table loaded", fill="white", font=("Segoe UI", 18, "bold"))
 
-    def draw_table(self, table: dict[str, Any]) -> None:
+    def draw_table(self, table: dict[str, Any], show_result: bool = True) -> None:
         self.update_status_labels(table)
         canvas = self.table_canvas
         canvas.delete("all")
@@ -366,8 +533,9 @@ class BlackjackControlPanel(tk.Tk):
 
         dealer_cards = table.get("dealer_hand", [])
         dealer_value = table.get("dealer_value", 0)
+        current_player_id = table.get("current_player_id")
         self.current_dealer_action = table.get("dealer_action", "waiting")
-        self.draw_hand("Dealer", dealer_cards, dealer_value, width // 2 - 120, 54)
+        self.draw_hand("Dealer", dealer_cards, dealer_value, width // 2 - 120, 54, active=current_player_id == "dealer")
 
         players = table.get("players", {})
         humans = [(pid, player) for pid, player in players.items() if not player.get("is_bot")]
@@ -380,7 +548,7 @@ class BlackjackControlPanel(tk.Tk):
             if player_id == self.player_id.get():
                 label += " - YOU"
             details = f"value {player['value']} | bet {player['bet']} | balance {player['balance']}"
-            self.draw_player(label, details, player.get("hand", []), x, y)
+            self.draw_player(label, details, player.get("hand", []), x, y, active=player_id == current_player_id)
             x += 330
             if x > width - 300:
                 x = 40
@@ -389,18 +557,21 @@ class BlackjackControlPanel(tk.Tk):
         bot_x = 46
         bot_y = max(285, y + 108 if humans else 188)
         for player_id, player in bots:
-            label = f"{player['name']} ({player_id}) - BOT"
+            label = f"{player['name']} {str(player_id).upper()}"
             details = f"value {player['value']} | bet {player['bet']} | balance {player['balance']}"
-            self.draw_player(label, details, player.get("hand", []), bot_x, bot_y)
+            self.draw_player(label, details, player.get("hand", []), bot_x, bot_y, active=player_id == current_player_id)
             bot_x += 330
             if bot_x > width - 300:
                 bot_x = 40
                 bot_y += 120
 
-        if table.get("last_result"):
+        if show_result and table.get("last_result"):
             self.draw_last_result(table["last_result"], width - 318, 54)
 
     def update_status_labels(self, table: dict[str, Any]) -> None:
+        self.cluster_status.set(
+            f"Cluster: host {self.server_host.get()} | selected port {self.selected_port.get()} | GM {table['game_master_id']} | version {table.get('state_version', 0)}"
+        )
         self.round_status.set(f"Round: {table['phase']} | GM {table['game_master_id']}")
         self.dealer_status.set(
             f"Dealer: {table.get('dealer_value', 0)} ({len(table.get('dealer_hand', []))} cards) | {table.get('dealer_action', 'waiting')}"
@@ -410,7 +581,7 @@ class BlackjackControlPanel(tk.Tk):
         own = players.get(self.player_id.get())
         if own:
             self.player_status.set(
-                f"You: {own['value']} | bet {own['bet']} | balance {own['balance']} | cards {len(own.get('hand', []))}"
+                f"You: Value {own['value']} | bet {own['bet']} | balance {own['balance']} | cards {len(own.get('hand', []))}"
             )
         else:
             self.player_status.set("You: not joined")
@@ -422,17 +593,30 @@ class BlackjackControlPanel(tk.Tk):
         ]
         self.bot_status.set("Bots: " + (", ".join(bot_parts) if bot_parts else "none"))
 
-    def draw_player(self, label: str, details: str, cards: list[str], x: int, y: int) -> None:
+    def draw_player(self, label: str, details: str, cards: list[str], x: int, y: int, active: bool = False) -> None:
         canvas = self.table_canvas
-        canvas.create_text(x, y, anchor="nw", text=label, fill="white", font=("Segoe UI", 11, "bold"))
-        canvas.create_text(x, y + 20, anchor="nw", text=details, fill="#e7f8ef", font=("Segoe UI", 9))
+        if active:
+            canvas.create_rectangle(x - 10, y - 8, x + 300, y + 122, fill="#f4c542", outline="#fff7c7", width=3)
+            canvas.create_text(x + 250, y, anchor="nw", text="ACTIVE", fill="#17351f", font=("Segoe UI", 9, "bold"))
+        canvas.create_text(x, y, anchor="nw", text=label, fill="#17351f" if active else "white", font=("Segoe UI", 11, "bold"))
+        canvas.create_text(x, y + 20, anchor="nw", text=details, fill="#17351f" if active else "#e7f8ef", font=("Segoe UI", 9))
         self.draw_cards(cards, x, y + 42)
 
-    def draw_hand(self, label: str, cards: list[str], value: int, x: int, y: int) -> None:
+    def draw_hand(self, label: str, cards: list[str], value: int, x: int, y: int, active: bool = False) -> None:
         action = ""
         if label == "Dealer":
             action = f" | {getattr(self, 'current_dealer_action', '')}"
-        self.table_canvas.create_text(x, y, anchor="nw", text=f"{label} | value {value}{action}", fill="white", font=("Segoe UI", 11, "bold"))
+        if active:
+            self.table_canvas.create_rectangle(x - 10, y - 8, x + 300, y + 104, fill="#f4c542", outline="#fff7c7", width=3)
+            self.table_canvas.create_text(x + 246, y, anchor="nw", text="ACTIVE", fill="#17351f", font=("Segoe UI", 9, "bold"))
+        self.table_canvas.create_text(
+            x,
+            y,
+            anchor="nw",
+            text=f"{label} | value {value}{action}",
+            fill="#17351f" if active else "white",
+            font=("Segoe UI", 11, "bold"),
+        )
         self.draw_cards(cards, x, y + 24)
 
     def draw_cards(self, cards: list[str], x: int, y: int) -> None:
