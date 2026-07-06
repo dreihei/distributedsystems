@@ -68,6 +68,10 @@ class Player:
     connected: bool = True
     stood: bool = False
     is_bot: bool = False
+    split_hand: list[Card] = field(default_factory=list)
+    split_stood: bool = False
+    split_bet: int = 0
+    on_split_hand: bool = False
 
     def to_dict(self) -> dict:
         return {
@@ -80,6 +84,10 @@ class Player:
             "connected": self.connected,
             "stood": self.stood,
             "is_bot": self.is_bot,
+            "split_hand": [card.to_dict() for card in self.split_hand],
+            "split_stood": self.split_stood,
+            "split_bet": self.split_bet,
+            "on_split_hand": self.on_split_hand,
         }
 
     @staticmethod
@@ -94,6 +102,10 @@ class Player:
             connected=raw["connected"],
             stood=raw["stood"],
             is_bot=raw.get("is_bot", False),
+            split_hand=[Card.from_dict(c) for c in raw.get("split_hand", [])],
+            split_stood=raw.get("split_stood", False),
+            split_bet=raw.get("split_bet", 0),
+            on_split_hand=raw.get("on_split_hand", False),
         )
 
 
@@ -144,6 +156,27 @@ class Table:
             self.place_bet(bot.player_id, default_bet)
         return bot
 
+    def can_split(self, player_id: str) -> bool:
+        player = self.players.get(player_id)
+        if not player or len(player.hand) != 2 or player.split_hand:
+            return False
+        return player.hand[0].rank == player.hand[1].rank and player.balance > player.bet
+
+    def can_double(self, player_id: str) -> bool:
+        player = self.players.get(player_id)
+        if not player or player.on_split_hand:
+            active_hand = player.split_hand if player and player.on_split_hand else (player.hand if player else [])
+            bet = player.split_bet if player and player.on_split_hand else (player.bet if player else 0)
+        else:
+            active_hand = player.hand
+            bet = player.bet
+        return bool(player and len(active_hand) == 2 and player.balance > bet)
+
+    def refill(self, player_id: str, amount: int = 1000) -> None:
+        if player_id in self.players:
+            self.players[player_id].balance += amount
+            self.bump()
+
     def start_round(self, auto_bets: bool = False) -> None:
         self.phase = "playing"
         self.deck = new_deck()
@@ -155,21 +188,57 @@ class Table:
         for player in self.players.values():
             player.hand = [self.draw(), self.draw()]
             player.stood = False
+            player.split_hand = []
+            player.split_stood = False
+            player.split_bet = 0
+            player.on_split_hand = False
         self.current_player_index = 0
         self.dealer_action = "waiting for players"
         self.record_action("round", "Round started")
+        # Auto-stand human players with 21 (blackjack on deal)
+        for player in self.players.values():
+            if not player.is_bot and hand_value(player.hand) == 21:
+                player.stood = True
+                self.record_player_action(player, "blackjack")
         self.play_bots()
+        if self.all_players_done() and self.phase == "playing":
+            self.finish_dealer()
+            return
         self.bump()
 
     def hit(self, player_id: str) -> None:
         player = self.players[player_id]
-        card = self.draw()
-        player.hand.append(card)
-        self.record_player_action(player, "draw", card)
-        if is_bust(player.hand):
-            player.stood = True
-            self.record_player_action(player, "bust")
-            self.advance_turn()
+        if player.on_split_hand:
+            card = self.draw()
+            player.split_hand.append(card)
+            self.record_player_action(player, "draw", card, use_split=True)
+            value = hand_value(player.split_hand)
+            if value > 21:
+                player.split_stood = True
+                player.stood = True
+                self.record_player_action(player, "bust", use_split=True)
+                self.advance_turn()
+            elif value == 21:
+                player.split_stood = True
+                player.stood = True
+                self.record_player_action(player, "stand", use_split=True)
+                self.advance_turn()
+        else:
+            card = self.draw()
+            player.hand.append(card)
+            self.record_player_action(player, "draw", card)
+            value = hand_value(player.hand)
+            if value > 21:
+                player.stood = True
+                self.record_player_action(player, "bust")
+                self.advance_turn()
+            elif value == 21:
+                if player.split_hand:
+                    player.on_split_hand = True
+                else:
+                    player.stood = True
+                    self.record_player_action(player, "stand")
+                    self.advance_turn()
         self.play_bots()
         if self.all_players_done() and self.phase == "playing":
             self.finish_dealer()
@@ -177,9 +246,86 @@ class Table:
 
     def stand(self, player_id: str) -> None:
         player = self.players[player_id]
-        player.stood = True
-        self.record_player_action(player, "stand")
-        self.advance_turn()
+        if player.on_split_hand:
+            player.split_stood = True
+            player.stood = True
+            self.record_player_action(player, "stand", use_split=True)
+            self.advance_turn()
+        elif player.split_hand:
+            # Switch to split hand
+            player.on_split_hand = True
+            self.record_player_action(player, "stand")
+            # Auto-stand on split if 21
+            if hand_value(player.split_hand) == 21:
+                player.split_stood = True
+                player.stood = True
+                self.advance_turn()
+        else:
+            player.stood = True
+            self.record_player_action(player, "stand")
+            self.advance_turn()
+        self.play_bots()
+        if self.all_players_done() and self.phase == "playing":
+            self.finish_dealer()
+        self.bump()
+
+    def double(self, player_id: str) -> None:
+        player = self.players[player_id]
+        if player.on_split_hand:
+            extra = min(player.split_bet, player.balance - player.split_bet)
+            player.split_bet += extra
+            card = self.draw()
+            player.split_hand.append(card)
+            self.record_player_action(player, "double", card, use_split=True)
+            player.split_stood = True
+            player.stood = True
+            if is_bust(player.split_hand):
+                self.record_player_action(player, "bust", use_split=True)
+            else:
+                self.record_player_action(player, "stand", use_split=True)
+            self.advance_turn()
+        else:
+            extra = min(player.bet, player.balance - player.bet)
+            player.bet += extra
+            card = self.draw()
+            player.hand.append(card)
+            self.record_player_action(player, "double", card)
+            if player.split_hand:
+                player.on_split_hand = True
+                if is_bust(player.hand):
+                    self.record_player_action(player, "bust")
+                # Auto-stand split if 21
+                if hand_value(player.split_hand) == 21:
+                    player.split_stood = True
+                    player.stood = True
+                    self.advance_turn()
+            else:
+                player.stood = True
+                if is_bust(player.hand):
+                    self.record_player_action(player, "bust")
+                else:
+                    self.record_player_action(player, "stand")
+                self.advance_turn()
+        self.play_bots()
+        if self.all_players_done() and self.phase == "playing":
+            self.finish_dealer()
+        self.bump()
+
+    def split(self, player_id: str) -> None:
+        player = self.players[player_id]
+        player.split_hand = [player.hand.pop()]
+        player.hand.append(self.draw())
+        player.split_hand.append(self.draw())
+        player.split_bet = player.bet
+        player.on_split_hand = False
+        self.record_action("player", f"{player.name} splits")
+        # Auto-stand if 21 on main hand
+        if hand_value(player.hand) == 21:
+            if hand_value(player.split_hand) == 21:
+                player.split_stood = True
+                player.stood = True
+            else:
+                player.on_split_hand = True
         self.play_bots()
         if self.all_players_done() and self.phase == "playing":
             self.finish_dealer()
@@ -201,12 +347,20 @@ class Table:
     def build_result(self) -> dict:
         dealer_score = hand_value(self.dealer_hand)
         dealer_bust = dealer_score > 21
+        dealer_bj = is_blackjack(self.dealer_hand)
         players = {}
         for player_id, player in self.players.items():
             score = hand_value(player.hand)
+            player_bj = is_blackjack(player.hand)
             if score > 21:
                 outcome = "lost"
                 payout = 0
+            elif player_bj and dealer_bj:
+                outcome = "push"
+                payout = player.bet
+            elif player_bj:
+                outcome = "blackjack"
+                payout = player.bet + int(player.bet * 1.5)
             elif dealer_bust or score > dealer_score:
                 outcome = "won"
                 payout = player.bet * 2
@@ -216,7 +370,8 @@ class Table:
             else:
                 outcome = "lost"
                 payout = 0
-            players[player_id] = {
+
+            entry: dict = {
                 "name": player.name,
                 "bet": player.bet,
                 "hand": [card.label() for card in player.hand],
@@ -225,6 +380,31 @@ class Table:
                 "payout": payout,
                 "is_bot": player.is_bot,
             }
+
+            if player.split_hand:
+                sscore = hand_value(player.split_hand)
+                if sscore > 21:
+                    soutcome = "lost"
+                    spayout = 0
+                elif dealer_bust or sscore > dealer_score:
+                    soutcome = "won"
+                    spayout = player.split_bet * 2
+                elif sscore == dealer_score:
+                    soutcome = "push"
+                    spayout = player.split_bet
+                else:
+                    soutcome = "lost"
+                    spayout = 0
+                entry["split_result"] = {
+                    "hand": [card.label() for card in player.split_hand],
+                    "value": sscore,
+                    "bet": player.split_bet,
+                    "outcome": soutcome,
+                    "payout": spayout,
+                }
+
+            players[player_id] = entry
+
         return {
             "dealer_hand": [card.label() for card in self.dealer_hand],
             "dealer_value": dealer_score,
@@ -243,15 +423,29 @@ class Table:
     def settle_bets(self) -> None:
         dealer_score = hand_value(self.dealer_hand)
         dealer_bust = dealer_score > 21
+        dealer_bj = is_blackjack(self.dealer_hand)
         for player in self.players.values():
             score = hand_value(player.hand)
-            won = score <= 21 and (dealer_bust or score > dealer_score)
-            pushed = score <= 21 and score == dealer_score
-            if won:
+            player_bj = is_blackjack(player.hand)
+            # Main hand
+            if player_bj and not dealer_bj:
+                player.balance += int(player.bet * 1.5)  # 3:2 payout
+            elif player_bj and dealer_bj:
+                pass  # push, no change
+            elif score <= 21 and (dealer_bust or score > dealer_score):
                 player.balance += player.bet
-            elif not pushed:
+            elif score > 21 or (not dealer_bust and score < dealer_score):
                 player.balance -= player.bet
+            # push: no change
             player.bet = 0
+            # Split hand
+            if player.split_hand:
+                sscore = hand_value(player.split_hand)
+                if sscore <= 21 and (dealer_bust or sscore > dealer_score):
+                    player.balance += player.split_bet
+                elif sscore > 21 or (not dealer_bust and sscore < dealer_score):
+                    player.balance -= player.split_bet
+                player.split_bet = 0
 
     def prepare_auto_bets(self) -> None:
         for player in self.players.values():
@@ -286,16 +480,24 @@ class Table:
         return any(not player.is_bot and player.balance > 0 for player in self.players.values())
 
     def all_players_done(self) -> bool:
-        return bool(self.players) and all(player.stood or is_bust(player.hand) for player in self.players.values())
+        if not self.players:
+            return False
+        for player in self.players.values():
+            if not player.stood:
+                return False
+            if player.split_hand and not player.split_stood:
+                return False
+        return True
 
     def draw(self) -> Card:
         if not self.deck:
             self.deck = new_deck()
         return self.deck.pop()
 
-    def record_player_action(self, player: Player, action: str, card: Card | None = None) -> None:
+    def record_player_action(self, player: Player, action: str, card: Card | None = None, use_split: bool = False) -> None:
         actor = "bot" if player.is_bot else "player"
-        value = hand_value(player.hand)
+        active_hand = player.split_hand if use_split else player.hand
+        value = hand_value(active_hand)
         self.action_log.append(
             {
                 "actor": actor,
@@ -303,9 +505,10 @@ class Table:
                 "name": player.name,
                 "action": action,
                 "card": card.label() if card else None,
-                "hand": [item.label() for item in player.hand],
+                "hand": [item.label() for item in active_hand],
                 "value": value,
                 "bust": value > 21,
+                "on_split_hand": use_split,
                 "message": self.action_message(actor, player.name, action, card, value),
             }
         )
@@ -333,10 +536,14 @@ class Table:
         label = "Dealer" if actor == "dealer" else name
         if action == "draw" and card:
             return f"{label} draws {card.label()} and now has {value}"
+        if action == "double" and card:
+            return f"{label} doubles and draws {card.label()} ({value})"
         if action == "stand":
             return f"{label} stands on {value}"
         if action == "bust":
             return f"{label} busts with {value}"
+        if action == "blackjack":
+            return f"{label} has Blackjack!"
         return f"{label}: {action} ({value})"
 
     def bump(self) -> None:
@@ -366,6 +573,11 @@ class Table:
                     "connected": player.connected,
                     "stood": player.stood,
                     "is_bot": player.is_bot,
+                    "split_hand": [card.label() for card in player.split_hand],
+                    "split_value": hand_value(player.split_hand) if player.split_hand else 0,
+                    "split_bet": player.split_bet,
+                    "split_stood": player.split_stood,
+                    "on_split_hand": player.on_split_hand,
                 }
                 for pid, player in self.players.items()
             },

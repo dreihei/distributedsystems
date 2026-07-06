@@ -101,6 +101,9 @@ class BlackjackServer:
             "NEW_ROUND": self.client_new_round,
             "HIT": self.client_hit,
             "STAND": self.client_stand,
+            "DOUBLE": self.client_double,
+            "SPLIT": self.client_split,
+            "REFILL_BALANCE": self.client_refill_balance,
         }
         handler = handlers.get(message.type)
         return await handler(message) if handler else {"error": f"unknown client message {message.type}"}
@@ -178,6 +181,34 @@ class BlackjackServer:
         if table.phase != "playing":
             return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
         table.stand(message.payload["player_id"])
+        await self.sync_table(table.table_id)
+        return {"table": table.snapshot()}
+
+    async def client_double(self, message: Message) -> dict:
+        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        if not self.is_game_master(table.table_id):
+            return await self.forward_to_master(message, table.table_id)
+        if table.phase != "playing":
+            return {"error": "round not active", "table": table.snapshot()}
+        table.double(message.payload["player_id"])
+        await self.sync_table(table.table_id)
+        return {"table": table.snapshot()}
+
+    async def client_split(self, message: Message) -> dict:
+        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        if not self.is_game_master(table.table_id):
+            return await self.forward_to_master(message, table.table_id)
+        if table.phase != "playing":
+            return {"error": "round not active", "table": table.snapshot()}
+        table.split(message.payload["player_id"])
+        await self.sync_table(table.table_id)
+        return {"table": table.snapshot()}
+
+    async def client_refill_balance(self, message: Message) -> dict:
+        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        if not self.is_game_master(table.table_id):
+            return await self.forward_to_master(message, table.table_id)
+        table.refill(message.payload["player_id"])
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 

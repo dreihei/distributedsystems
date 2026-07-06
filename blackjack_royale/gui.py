@@ -328,6 +328,8 @@ class BlackjackControlPanel(tk.Tk):
             ("Start Round", self.start_round),
             ("Hit", self.hit),
             ("Stand", self.stand),
+            ("Double", self.double),
+            ("Split", self.split),
         ]:
             button = ttk.Button(buttons, text=label, command=command)
             button.pack(side="left", padx=2, pady=2)
@@ -463,7 +465,12 @@ class BlackjackControlPanel(tk.Tk):
         self.run_client_command("ADD_BOT", payload)
 
     def place_bet(self) -> None:
-        self.run_client_command("PLACE_BET", self.base_player_payload() | {"amount": self.bet_amount.get()})
+        amount = self.bet_amount.get()
+        player_data = self.known_tables.get(self.table_id.get(), {}).get("players", {}).get(self.player_id.get())
+        if player_data and amount > player_data["balance"]:
+            messagebox.showwarning("Zu wenig Chips", f"Du hast nur {player_data['balance']} Chips. Einsatz angepasst.")
+            return
+        self.run_client_command("PLACE_BET", self.base_player_payload() | {"amount": amount})
 
     def start_round(self) -> None:
         self.run_client_command("START_ROUND", {"table_id": self.table_id.get()})
@@ -476,6 +483,15 @@ class BlackjackControlPanel(tk.Tk):
 
     def stand(self) -> None:
         self.run_client_command("STAND", self.base_player_payload())
+
+    def double(self) -> None:
+        self.run_client_command("DOUBLE", self.base_player_payload())
+
+    def split(self) -> None:
+        self.run_client_command("SPLIT", self.base_player_payload())
+
+    def refill_balance(self) -> None:
+        self.run_client_command("REFILL_BALANCE", self.base_player_payload())
 
     def demo_sequence(self) -> None:
         steps = [
@@ -571,7 +587,7 @@ class BlackjackControlPanel(tk.Tk):
         if table:
             self.log_queue.put(("UPDATE_TABLES", [table]))
             actions = self.new_actions(table)
-            animated_messages = {"START_ROUND", "HIT", "STAND", "NEW_ROUND"}
+            animated_messages = {"START_ROUND", "HIT", "STAND", "NEW_ROUND", "DOUBLE", "SPLIT"}
             if actions and message_type in animated_messages:
                 self.log_queue.put(("ANIMATE", table, actions))
             else:
@@ -594,6 +610,50 @@ class BlackjackControlPanel(tk.Tk):
         self.action_history.insert("end", message + "\n")
         self.action_history.see("end")
         self.action_history.configure(state="disabled")
+
+    def update_gameplay_buttons(self, table: dict) -> None:
+        if self.animation_running:
+            return
+        phase = table.get("phase")
+        current_pid = table.get("current_player_id")
+        my_pid = self.player_id.get()
+        is_my_turn = phase == "playing" and current_pid == my_pid
+        player = table.get("players", {}).get(my_pid, {})
+        on_split = player.get("on_split_hand", False)
+        hand = player.get("hand", [])
+        split_hand = player.get("split_hand", [])
+        active_hand = split_hand if on_split else hand
+        n_cards = len(active_hand)
+        balance = player.get("balance", 0)
+        bet = player.get("split_bet", 0) if on_split else player.get("bet", 0)
+
+        can_split = (
+            is_my_turn
+            and n_cards == 2
+            and not split_hand
+            and len(hand) == 2
+            and len(hand) >= 2
+            and hand[0].split(" of ")[0] == hand[1].split(" of ")[0]
+            and balance > bet
+        )
+
+        states = {
+            "Start Round": "normal" if phase in ("waiting", "finished") else "disabled",
+            "Hit":         "normal" if is_my_turn else "disabled",
+            "Stand":       "normal" if is_my_turn else "disabled",
+            "Double":      "normal" if is_my_turn and n_cards == 2 and balance > bet else "disabled",
+            "Split":       "normal" if can_split else "disabled",
+        }
+        for label, btn in self.command_buttons.items():
+            btn.configure(state=states.get(label, "normal"))
+
+    def check_empty_balance(self, table: dict) -> None:
+        if table.get("phase") != "finished":
+            return
+        player = table.get("players", {}).get(self.player_id.get())
+        if player and player.get("balance", 1) <= 0:
+            if messagebox.askyesno("Keine Chips mehr", "Du hast keine Chips mehr!\n1000 Chips auffüllen?"):
+                self.refill_balance()
 
     def set_gameplay_buttons_enabled(self, enabled: bool) -> None:
         state = "normal" if enabled and not self.animation_running else "disabled"
@@ -628,6 +688,7 @@ class BlackjackControlPanel(tk.Tk):
         actor = action.get("actor")
         hand = action.get("hand")
         value = action.get("value")
+        on_split = action.get("on_split_hand", False)
         if actor == "dealer" and hand is not None:
             visible["current_player_id"] = "dealer"
             visible["dealer_hand"] = hand
@@ -637,9 +698,15 @@ class BlackjackControlPanel(tk.Tk):
             visible["current_player_id"] = action.get("player_id")
             player = visible.get("players", {}).get(action.get("player_id"))
             if player:
-                player["hand"] = hand
-                player["value"] = value
-                player["stood"] = action.get("action") in {"stand", "bust"}
+                if on_split:
+                    player["split_hand"] = hand
+                    player["split_value"] = value
+                    player["split_stood"] = action.get("action") in {"stand", "bust"}
+                    player["on_split_hand"] = True
+                else:
+                    player["hand"] = hand
+                    player["value"] = value
+                    player["stood"] = action.get("action") in {"stand", "bust"}
         return visible
 
     def show_next_round_popup(self) -> None:
@@ -684,8 +751,16 @@ class BlackjackControlPanel(tk.Tk):
             label = f"{player['name']} ({player_id})"
             if player_id == self.player_id.get():
                 label += " - YOU"
-            details = f"value {player['value']} | bet {player['bet']} | balance {player['balance']}"
-            self.draw_player(label, details, player.get("hand", []), x, y, active=player_id == current_player_id)
+            on_split = player.get("on_split_hand", False)
+            hand_indicator = " [SPLIT HAND]" if on_split else ""
+            details = f"value {player['value']}{hand_indicator} | bet {player['bet']} | balance {player['balance']}"
+            self.draw_player(label, details, player.get("hand", []), x, y, active=player_id == current_player_id and not on_split)
+            split_hand = player.get("split_hand", [])
+            if split_hand:
+                split_value = player.get("split_value", 0)
+                split_details = f"SPLIT | value {split_value} | bet {player.get('split_bet', 0)}"
+                self.draw_player(split_details, "", split_hand, x + 340, y, active=player_id == current_player_id and on_split)
+                x += 340
             x += 330
             if x > width - 300:
                 x = 40
@@ -704,6 +779,10 @@ class BlackjackControlPanel(tk.Tk):
 
         if show_result and table.get("last_result"):
             self.draw_last_result(table["last_result"], width - 318, 54)
+
+        self.update_gameplay_buttons(table)
+        if show_result:
+            self.check_empty_balance(table)
 
     def update_status_labels(self, table: dict[str, Any]) -> None:
         self.cluster_status.set(
@@ -772,9 +851,15 @@ class BlackjackControlPanel(tk.Tk):
             f"Dealer {result['dealer_value']} {'bust' if result.get('dealer_bust') else ''}".strip(),
         ]
         for player in result.get("players", {}).values():
-            lines.append(f"{player['name']}: {player['outcome']} payout {player['payout']}")
-        self.table_canvas.create_rectangle(x, y, x + 280, y + 120, fill="#0b3d2c", outline="#d9f2e4")
-        for offset, line in enumerate(lines[:5]):
+            outcome = player["outcome"]
+            payout_label = f"payout {player['payout']}" if outcome != "push" else "push"
+            lines.append(f"{player['name']}: {outcome} {payout_label}")
+            split = player.get("split_result")
+            if split:
+                lines.append(f"  split: {split['outcome']} payout {split['payout']}")
+        height = max(120, 30 + len(lines) * 22)
+        self.table_canvas.create_rectangle(x, y, x + 280, y + height, fill="#0b3d2c", outline="#d9f2e4")
+        for offset, line in enumerate(lines[:8]):
             font = ("Segoe UI", 10, "bold") if offset == 0 else ("Segoe UI", 9)
             self.table_canvas.create_text(x + 10, y + 10 + offset * 22, anchor="nw", text=line, fill="white", font=font)
 
