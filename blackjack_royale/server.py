@@ -14,7 +14,7 @@ import json
 import time
 from typing import Awaitable, Callable
 
-from .blackjack import Table
+from .blackjack import RuleError, Table
 from .config import DEFAULT_CONFIG, RuntimeConfig
 from .discovery import DISCOVERY_REQUEST, DISCOVERY_RESPONSE, local_lan_ip
 from .messages import Message, read_message, send_message
@@ -110,13 +110,23 @@ class BlackjackServer:
             "REFILL_BALANCE": self.client_refill_balance,
         }
         handler = handlers.get(message.type)
-        return await handler(message) if handler else {"error": f"unknown client message {message.type}"}
+        if handler is None:
+            return {"error": f"unknown client message {message.type}"}
+        try:
+            return await handler(message)
+        except RuleError as exc:
+            response: dict = {"error": str(exc)}
+            table = self.find_table(message)
+            if table is not None:
+                response["table"] = table.snapshot()
+            return response
 
     async def route_peer_message(self, message: Message) -> dict:
         handlers: dict[str, Handler] = {
             "SERVER_ANNOUNCE": self.peer_announce,
             "HEARTBEAT": self.peer_heartbeat,
             "STATE_SYNC": self.peer_state_sync,
+            "GET_TABLES": self.peer_get_tables,
             "ELECTION": self.peer_election,
             "COORDINATOR": self.peer_coordinator,
         }
@@ -126,8 +136,23 @@ class BlackjackServer:
     async def client_list_tables(self, message: Message) -> dict:
         return {"tables": [table.snapshot() for table in self.state.tables.values()]}
 
+    def find_table(self, message: Message) -> Table | None:
+        return self.state.tables.get(message.payload.get("table_id", "main"))
+
+    def unknown_table_error(self, message: Message) -> dict:
+        return {"error": f"unknown table {message.payload.get('table_id', 'main')}; join first"}
+
     async def client_join_table(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            # Only the cluster coordinator (highest active id) may create tables.
+            # Everyone else forwards the join so no second lineage can appear.
+            coordinator_id = self.state.highest_active_server_id()
+            if coordinator_id != self.state.server_id:
+                peer = self.state.peers.get(coordinator_id)
+                response = await self.request(peer.host, peer.client_port, message) if peer else None
+                return response or {"error": "coordinator unavailable"}
+            table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
         player = table.join(message.payload.get("player_id"), message.payload.get("name", "Player"))
@@ -135,7 +160,9 @@ class BlackjackServer:
         return {"table": table.snapshot(), "player_id": player.player_id}
 
     async def client_add_bot(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
         bot_name = message.payload.get("name") or "Bot"
@@ -144,7 +171,9 @@ class BlackjackServer:
         return {"table": table.snapshot()}
 
     async def client_place_bet(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
         player_id = message.payload.get("player_id")
@@ -155,7 +184,9 @@ class BlackjackServer:
         return {"table": table.snapshot()}
 
     async def client_start_round(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
         table.start_round()
@@ -163,7 +194,9 @@ class BlackjackServer:
         return {"table": table.snapshot()}
 
     async def client_new_round(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
         player_id = message.payload.get("player_id")
@@ -181,11 +214,11 @@ class BlackjackServer:
         return None
 
     async def client_hit(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        if table.phase != "playing":
-            return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
@@ -197,11 +230,11 @@ class BlackjackServer:
         return {"table": table.snapshot()}
 
     async def client_stand(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        if table.phase != "playing":
-            return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
@@ -213,11 +246,11 @@ class BlackjackServer:
         return {"table": table.snapshot()}
 
     async def client_double(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        if table.phase != "playing":
-            return {"error": "round not active", "table": table.snapshot()}
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
@@ -229,11 +262,11 @@ class BlackjackServer:
         return {"table": table.snapshot()}
 
     async def client_split(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        if table.phase != "playing":
-            return {"error": "round not active", "table": table.snapshot()}
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
@@ -245,7 +278,9 @@ class BlackjackServer:
         return {"table": table.snapshot()}
 
     async def client_refill_balance(self, message: Message) -> dict:
-        table = self.state.ensure_table(message.payload.get("table_id", "main"))
+        table = self.find_table(message)
+        if table is None:
+            return self.unknown_table_error(message)
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
         player_id = message.payload.get("player_id")
@@ -260,12 +295,29 @@ class BlackjackServer:
         return {"peer": self.state.local_peer().__dict__, "tables": self.serialized_tables()}
 
     async def peer_heartbeat(self, message: Message) -> dict:
-        self.state.upsert_peer(Peer(**message.payload))
-        return {"peer": self.state.local_peer().__dict__}
+        self.state.upsert_peer(Peer(**message.payload["peer"]))
+        return {
+            "peer": self.state.local_peer().__dict__,
+            "tables": self.stale_tables_for(message.payload.get("tables", {})),
+        }
+
+    def stale_tables_for(self, remote_versions: dict) -> list[dict]:
+        """Full snapshots of tables this server masters and the sender lags behind on."""
+        stale = []
+        for table_id, table in self.state.tables.items():
+            if not self.is_game_master(table_id):
+                continue
+            remote = remote_versions.get(table_id)
+            if remote is None or remote.get("lineage") != table.lineage or remote.get("version", 0) < table.state_version:
+                stale.append(table.to_dict())
+        return stale
 
     async def peer_state_sync(self, message: Message) -> dict:
         self.state.apply_snapshot(message.payload["table"])
         return {"state_version": message.payload["table"]["state_version"]}
+
+    async def peer_get_tables(self, message: Message) -> dict:
+        return {"tables": self.serialized_tables()}
 
     async def peer_election(self, message: Message) -> dict:
         caller = int(message.sender)
@@ -308,14 +360,30 @@ class BlackjackServer:
     async def heartbeat_loop(self) -> None:
         while True:
             await self.send_heartbeats()
+            self.prune_dead_peers()
             await self.detect_failed_master()
             await asyncio.sleep(self.config.heartbeat_interval)
 
+    def table_versions(self) -> dict:
+        return {
+            table_id: {"lineage": table.lineage, "version": table.state_version}
+            for table_id, table in self.state.tables.items()
+        }
+
     async def send_heartbeats(self) -> None:
+        payload = {"peer": self.state.local_peer().__dict__, "tables": self.table_versions()}
         for peer in list(self.state.peers.values()):
-            response = await self.request(peer.host, peer.server_port, Message("HEARTBEAT", str(self.state.server_id), self.state.local_peer().__dict__))
+            response = await self.request(peer.host, peer.server_port, Message("HEARTBEAT", str(self.state.server_id), payload))
             if response:
                 peer.touch()
+                # The response repairs any table we are behind on (anti-entropy).
+                self.learn_from_response(response)
+
+    def prune_dead_peers(self) -> None:
+        now = time.time()
+        for server_id, peer in list(self.state.peers.items()):
+            if now - peer.last_seen > self.config.heartbeat_timeout:
+                del self.state.peers[server_id]
 
     async def detect_failed_master(self) -> None:
         now = time.time()
@@ -359,11 +427,27 @@ class BlackjackServer:
         self.election_running = False
 
     async def become_coordinator(self) -> None:
+        # Read repair: adopt the freshest table state from all reachable peers
+        # before taking over, so a backup that missed the old master's last
+        # sync cannot make us resurrect stale state.
+        await self.pull_latest_tables()
         for table in self.state.tables.values():
             table.game_master_id = self.state.server_id
+            table.bump()
         message = Message("COORDINATOR", str(self.state.server_id), {"server_id": self.state.server_id})
         await asyncio.gather(*[self.request(peer.host, peer.server_port, message) for peer in self.state.peers.values()])
+        for table_id in list(self.state.tables):
+            await self.sync_table(table_id)
         print(f"server {self.state.server_id} became game master", flush=True)
+
+    async def pull_latest_tables(self) -> None:
+        message = Message("GET_TABLES", str(self.state.server_id), {})
+        responses = await asyncio.gather(
+            *[self.request(peer.host, peer.server_port, message) for peer in self.state.peers.values()]
+        )
+        for response in responses:
+            for table in (response or {}).get("tables", []):
+                self.state.apply_snapshot(table)
 
     async def sync_table(self, table_id: str) -> None:
         table = self.state.tables[table_id]

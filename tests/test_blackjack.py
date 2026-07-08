@@ -2,7 +2,12 @@ import time
 import unittest
 import unittest.mock
 
-from blackjack_royale.blackjack import Card, Table, hand_value, is_blackjack, is_bust
+from blackjack_royale.blackjack import Card, RuleError, Table, hand_value, is_blackjack, is_bust
+
+NO_BLACKJACK_DECK_ONE_PLAYER = [
+    Card("7", "diamonds"), Card("4", "diamonds"),
+    Card("K", "hearts"), Card("9", "spades"),
+]
 
 
 class BlackjackRulesTest(unittest.TestCase):
@@ -39,7 +44,7 @@ class BlackjackRulesTest(unittest.TestCase):
         self.assertEqual(table.phase, "finished")
         self.assertEqual(table.players["p1"].bet, 0)
         self.assertIsNotNone(table.last_result)
-        self.assertGreaterEqual(table.last_result["dealer_value"], 18)
+        self.assertGreaterEqual(table.last_result["dealer_value"], 17)
 
     def test_bot_can_join_table(self) -> None:
         table = Table(table_id="main", game_master_id=3)
@@ -98,15 +103,25 @@ class BlackjackRulesTest(unittest.TestCase):
         self.assertGreaterEqual(hand_value(bot.hand), 16)
         self.assertTrue(bot.stood)
 
-    def test_dealer_draws_until_18_then_stands(self) -> None:
+    def test_dealer_draws_until_17_then_stands(self) -> None:
         table = Table(table_id="main", game_master_id=3)
         table.dealer_hand = [Card("5", "clubs"), Card("6", "spades")]
         table.deck = [Card("K", "diamonds"), Card("7", "hearts")]
 
         table.finish_dealer()
 
-        self.assertGreaterEqual(table.last_result["dealer_value"], 18)
+        self.assertGreaterEqual(table.last_result["dealer_value"], 17)
         self.assertIn(table.last_result["dealer_action"], {"stand", "bust"})
+
+    def test_dealer_stands_on_exactly_17(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        table.dealer_hand = [Card("K", "clubs"), Card("7", "spades")]
+        table.deck = [Card("5", "diamonds")]
+
+        table.finish_dealer()
+
+        self.assertEqual(table.last_result["dealer_value"], 17)
+        self.assertEqual(table.last_result["dealer_action"], "stand")
 
     def test_join_without_player_id_assigns_sequential_ids(self) -> None:
         table = Table(table_id="main", game_master_id=3)
@@ -185,6 +200,96 @@ class BlackjackRulesTest(unittest.TestCase):
         self.assertEqual(table.phase, "playing")
         self.assertEqual(table.current_player().player_id, "p2")
         self.assertEqual(table.snapshot()["current_player_id"], "p2")
+
+    def start_fixed_round(self, table: Table) -> None:
+        with unittest.mock.patch(
+            "blackjack_royale.blackjack.new_deck", side_effect=lambda: list(NO_BLACKJACK_DECK_ONE_PLAYER)
+        ):
+            table.start_round()
+
+    def test_busting_main_hand_moves_to_split_hand(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        p1 = table.join("p1", "Alice")
+        table.place_bet("p1", 50)
+        table.phase = "playing"
+        p1.hand = [Card("8", "spades"), Card("8", "hearts")]
+        table.deck = [Card("K", "clubs"), Card("9", "clubs"), Card("2", "diamonds"), Card("3", "diamonds")]
+
+        table.split("p1")       # hand: 8+3=11, split: 8+2=10
+        table.hit("p1")         # hand: +9 -> 20
+        table.hit("p1")         # hand: +K -> 30, bust
+
+        self.assertTrue(p1.on_split_hand)
+        self.assertFalse(p1.split_stood)
+        self.assertEqual(table.phase, "playing")
+
+        table.stand("p1")       # finish the split hand
+        self.assertEqual(table.phase, "finished")
+
+    def test_place_bet_rejected_during_round(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        table.join("p1", "Alice")
+        table.place_bet("p1", 50)
+        self.start_fixed_round(table)
+
+        with self.assertRaises(RuleError):
+            table.place_bet("p1", 200)
+
+    def test_start_round_rejected_while_playing(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        table.join("p1", "Alice")
+        table.place_bet("p1", 50)
+        self.start_fixed_round(table)
+
+        with self.assertRaises(RuleError):
+            table.start_round()
+
+    def test_new_players_cannot_join_mid_round_but_reconnect_works(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        table.join("p1", "Alice")
+        table.place_bet("p1", 50)
+        self.start_fixed_round(table)
+
+        with self.assertRaises(RuleError):
+            table.join("p2", "Latecomer")
+        reconnected = table.join("p1", "Alice")
+        self.assertEqual(reconnected.player_id, "p1")
+
+    def test_split_requires_a_pair(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        p1 = table.join("p1", "Alice")
+        table.place_bet("p1", 50)
+        table.phase = "playing"
+        p1.hand = [Card("K", "spades"), Card("7", "hearts")]
+
+        with self.assertRaises(RuleError):
+            table.split("p1")
+
+    def test_double_requires_exactly_two_cards(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        p1 = table.join("p1", "Alice")
+        table.place_bet("p1", 50)
+        table.phase = "playing"
+        p1.hand = [Card("2", "spades"), Card("3", "hearts"), Card("4", "clubs")]
+
+        with self.assertRaises(RuleError):
+            table.double("p1")
+
+    def test_result_payout_matches_settled_balance(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        player = table.join("p1", "Alice")
+        table.place_bet("p1", 50)
+        table.phase = "playing"
+        player.hand = [Card("A", "spades"), Card("K", "hearts")]  # blackjack
+        table.dealer_hand = [Card("K", "clubs"), Card("9", "diamonds")]
+        table.deck = [Card("5", "clubs")]
+
+        table.finish_dealer()
+
+        result = table.last_result["players"]["p1"]
+        self.assertEqual(result["outcome"], "blackjack")
+        self.assertEqual(result["payout"], 125)          # stake 50 + 3:2 win 75
+        self.assertEqual(player.balance, 1075)           # display and balance agree
 
     def test_rejoin_with_existing_player_id_preserves_state(self) -> None:
         table = Table(table_id="main", game_master_id=3)

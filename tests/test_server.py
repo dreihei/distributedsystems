@@ -77,6 +77,56 @@ class ServerHandlersTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["error"], "not your turn")
 
+    async def test_action_on_unknown_table_returns_error(self) -> None:
+        server = self.make_server()
+
+        response = await server.client_hit(Message("HIT", "client", {"table_id": "main", "player_id": "p1"}))
+
+        self.assertIn("unknown table", response["error"])
+        self.assertNotIn("main", server.state.tables)
+
+    async def test_join_creates_table_only_on_coordinator(self) -> None:
+        server = self.make_server()  # id 1, no peers -> coordinator
+
+        response = await server.client_join_table(
+            Message("JOIN_TABLE", "client", {"table_id": "main", "name": "Alice"})
+        )
+
+        self.assertEqual(response["player_id"], "p1")
+        self.assertEqual(server.state.tables["main"].game_master_id, 1)
+
+    async def test_rule_error_is_translated_to_error_response(self) -> None:
+        server = self.make_server()
+        await server.client_join_table(Message("JOIN_TABLE", "client", {"table_id": "main", "name": "Alice"}))
+
+        response = await server.route_client_message(
+            Message("SPLIT", "client", {"table_id": "main", "player_id": "p1"})
+        )
+
+        self.assertIn("error", response)
+        self.assertIn("table", response)
+
+    async def test_heartbeat_repairs_stale_peer(self) -> None:
+        server = self.make_server()
+        await server.client_join_table(Message("JOIN_TABLE", "client", {"table_id": "main", "name": "Alice"}))
+        table = server.state.tables["main"]
+        peer_info = {"server_id": 2, "host": "127.0.0.1", "server_port": 9102, "client_port": 9002}
+
+        stale = await server.peer_heartbeat(Message("HEARTBEAT", "2", {
+            "peer": peer_info,
+            "tables": {"main": {"lineage": table.lineage, "version": table.state_version - 1}},
+        }))
+        current = await server.peer_heartbeat(Message("HEARTBEAT", "2", {
+            "peer": peer_info,
+            "tables": {"main": {"lineage": table.lineage, "version": table.state_version}},
+        }))
+        unknown = await server.peer_heartbeat(Message("HEARTBEAT", "2", {"peer": peer_info, "tables": {}}))
+
+        self.assertEqual(len(stale["tables"]), 1)
+        self.assertEqual(stale["tables"][0]["state_version"], table.state_version)
+        self.assertEqual(current["tables"], [])
+        self.assertEqual(len(unknown["tables"]), 1)
+
     async def test_rejoin_with_known_player_id_resumes_same_player(self) -> None:
         server = self.make_server()
         first = await server.client_join_table(Message("JOIN_TABLE", "client", {"table_id": "main", "name": "Alice"}))

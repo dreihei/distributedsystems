@@ -15,10 +15,10 @@ Dann:
 3. Optional `Add Bot` klicken.
 4. `Place Bet` klicken.
 5. `Start Round` klicken.
-6. Mit `Hit` oder `Stand` spielen.
-7. `Refresh` aktualisiert die grafische Anzeige.
-8. Fuer Failover `Simulate Game Master Failure` klicken.
-9. Danach erneut `Refresh` oder einen Spielbutton nutzen.
+6. Mit `Hit`, `Stand`, `Double` oder `Split` spielen; nach der Runde `New Round` (oder das Popup) nutzen.
+7. Die Anzeige aktualisiert sich automatisch alle 2 Sekunden; `Refresh` erzwingt eine Aktualisierung.
+8. Fuer Failover `Fail GM` klicken (stoppt Server 3).
+9. Danach erneut `Refresh` oder einen Spielbutton nutzen - die GUI weicht automatisch auf die verbleibenden Server aus.
 
 Die grafische Anzeige zeigt oben den Dealer, darunter deine eigene Hand und darunter/nebendran Bots. In der Statuszeile stehen Dealer-Wert, eigener Wert, Einsatz, Kontostand und Bot-Werte.
 

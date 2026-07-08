@@ -33,15 +33,15 @@ Erwartung:
 In der GUI:
 
 1. Server-Port auf `9003` lassen.
-2. `Join` klicken.
-3. `Bet` klicken.
+2. `Join Table` klicken.
+3. `Place Bet` klicken.
 4. `Start Round` klicken.
-5. `Tables` klicken.
+5. `Refresh` klicken.
 
 Erwartung:
 
 - Spieler `p1` erscheint in der Tabelle.
-- Balance sinkt nach dem Einsatz.
+- Der Einsatz steht in `bet`; die Balance aendert sich erst bei der Abrechnung am Rundenende.
 - Nach `Start Round` haben Spieler und Dealer Karten.
 
 ## 4. Blackjack-Spielaktionen
@@ -50,28 +50,29 @@ In der GUI:
 
 1. Nach gestarteter Runde `Hit` klicken.
 2. Danach `Stand` klicken.
-3. `Tables` klicken.
+3. `Refresh` klicken.
 
 Erwartung:
 
 - Bei `Hit` bekommt der Spieler eine weitere Karte.
 - Bei `Stand` wird der Spieler als fertig markiert.
-- Wenn alle Spieler fertig sind, zieht der Dealer, Gewinn/Verlust wird berechnet und direkt eine neue Runde gestartet.
-- Die neue Runde ist wieder `phase: "playing"`.
-- In `last_result` sieht man die finale Dealer-Hand der vorherigen Runde.
+- Wenn alle Spieler fertig sind, zieht der Dealer (bis mindestens 17), Gewinn/Verlust wird berechnet und die Runde geht auf `phase: "finished"`.
+- Die GUI fragt per Popup, ob eine neue Runde gestartet werden soll (`New Round`).
+- In `last_result` sieht man die finale Dealer-Hand der Runde.
 - In der GUI sieht man die Karten grafisch auf dem Tisch.
-- Bei Gewinn steigt `balance`, bei Verlust sinkt `balance`, und der neue aktive Einsatz steht separat in `bet`.
+- Bei Gewinn steigt `balance` (bei Blackjack im Verhaeltnis 3:2), bei Verlust sinkt `balance`; der Einsatz der naechsten Runde steht separat in `bet`.
+- Unzulaessige Aktionen (z.B. `Start Round` waehrend eine Runde laeuft oder Einsatz aendern mid-round) liefern eine Fehlerantwort.
 
 ## 4.1 Bots testen
 
 In der GUI:
 
-1. `Join` fuer Spieler `p1` klicken.
+1. `Join Table` fuer Spieler `p1` klicken.
 2. `Add Bot` klicken.
-3. `Bet` klicken.
+3. `Place Bet` klicken.
 4. `Start Round` klicken.
 5. `Stand` klicken.
-6. `Tables` klicken.
+6. `Refresh` klicken.
 
 Erwartung:
 
@@ -79,7 +80,7 @@ Erwartung:
 - Der Bot hat eigene Karten.
 - Der Bot zieht automatisch, wenn sein Wert unter 16 ist.
 - Ab 16 bleibt der Bot stehen.
-- Danach wird abgerechnet und direkt eine neue Runde gestartet.
+- Danach wird abgerechnet; die naechste Runde startet ueber das Popup bzw. `New Round`.
 
 ## 5. State Sync zwischen Servern
 
@@ -87,12 +88,13 @@ In der GUI:
 
 1. Spielstand ueber Port `9003` erzeugen.
 2. Server-Port auf `9002` setzen.
-3. `Tables` klicken.
+3. `Refresh` klicken.
 
 Erwartung:
 
 - Server 2 kennt denselben Spielstand.
-- Die `state_version` ist synchronisiert.
+- `state_version` und `lineage` sind auf allen Servern identisch.
+- Auch ein absichtlich verpasster Sync (z.B. Server 2 kurz pausieren) wird ueber den Heartbeat innerhalb von 1 bis 2 Sekunden nachgeliefert.
 
 ## 6. Heartbeat
 
@@ -112,24 +114,24 @@ In der GUI:
 
 1. Alle Server starten.
 2. Demo-Sequenz ausfuehren.
-3. `Simulate Game Master Failure` klicken.
+3. `Fail GM` klicken.
 4. 5 bis 8 Sekunden warten.
 5. Server-Port auf `9002` setzen.
-6. `Tables` klicken.
+6. `Refresh` klicken.
 
 Erwartung:
 
 - Server 3 wird gestoppt.
-- Server 2 uebernimmt als neuer Game Master.
-- In der Ausgabe sollte `game_master_id` den Wert `2` zeigen.
-- Der Spielstand bleibt erhalten.
+- Server 2 uebernimmt als neuer Game Master (mit Read-Repair: er uebernimmt vorher den frischesten Spielstand der erreichbaren Peers).
+- In der Ausgabe sollte `game_master_id` den Wert `2` zeigen und die `state_version` um 1 erhoeht sein.
+- Der Spielstand (Spieler, Haende, Balance, `lineage`) bleibt erhalten.
 
 ## 8. Election ist nicht Game-State-Consistency
 
 Durchfuehrung:
 
 1. Vor dem Stoppen von Server 3 einen Spielstand erzeugen.
-2. Nach dem Failover auf Server 2 `Tables` klicken.
+2. Nach dem Failover auf Server 2 `Refresh` klicken.
 
 Erwartung:
 
@@ -140,9 +142,9 @@ Erwartung:
 
 In der GUI:
 
-1. `Join` fuer `p1` klicken.
+1. `Join Table` fuer `p1` klicken.
 2. Name oder Port unveraendert lassen.
-3. `Join` erneut klicken.
+3. `Join Table` erneut klicken.
 
 Erwartung:
 

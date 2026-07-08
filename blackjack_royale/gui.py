@@ -25,7 +25,15 @@ SERVER_PRESETS = {
 }
 ACTION_REPLAY_DELAY_MS = 1800
 TABLE_POLL_INTERVAL_MS = 2000
-ELECTION_IN_PROGRESS_ERRORS = {"forward failed", "game master unavailable"}
+RETRY_ELSEWHERE_ERRORS = {"forward failed", "game master unavailable", "coordinator unavailable"}
+
+
+def retryable_elsewhere(response: dict) -> bool:
+    """True if another server might be able to answer this request."""
+    error = response.get("error")
+    if not error:
+        return False
+    return error in RETRY_ELSEWHERE_ERRORS or error.startswith("unknown table")
 
 
 class ServerProcess:
@@ -114,6 +122,7 @@ class BlackjackControlPanel(tk.Tk):
         self.action_history: tk.Text | None = None
 
         self.known_tables: dict[str, dict] = {}
+        self.table_received_at: dict[str, float] = {}
         self.tables_panel_visible = True
         self.tables_panel_content: ttk.Frame | None = None
         self.tables_toggle_btn: ttk.Button | None = None
@@ -248,6 +257,7 @@ class BlackjackControlPanel(tk.Tk):
     def update_tables_panel(self, tables: list[dict]) -> None:
         for table in tables:
             self.known_tables[table["table_id"]] = table
+            self.table_received_at[table["table_id"]] = time.time()
         if self.tables_panel_content is None:
             return
         for child in self.tables_panel_content.winfo_children():
@@ -534,7 +544,7 @@ class BlackjackControlPanel(tk.Tk):
         ports = self.command_ports()
         try:
             response = asyncio.run(send(self.server_host.get(), ports[0], message_type, payload))
-            if response.get("error") in ELECTION_IN_PROGRESS_ERRORS:
+            if retryable_elsewhere(response):
                 self.try_fallback_ports(message_type, payload, ports[1:], OSError(response["error"]))
                 return
             formatted = json.dumps(response, indent=2)
@@ -565,7 +575,7 @@ class BlackjackControlPanel(tk.Tk):
             except OSError as exc:
                 last_error = exc
                 continue
-            if response.get("error") in ELECTION_IN_PROGRESS_ERRORS:
+            if retryable_elsewhere(response):
                 last_error = OSError(response["error"])
                 continue
             formatted = json.dumps(response, indent=2)
@@ -597,8 +607,12 @@ class BlackjackControlPanel(tk.Tk):
 
     def tick_turn_timer(self) -> None:
         table = self.known_tables.get(self.table_id.get())
-        if table and table.get("phase") == "playing" and table.get("turn_deadline"):
-            remaining = max(0, int(table["turn_deadline"] - time.time()))
+        remaining_at_receive = table.get("turn_remaining") if table else None
+        if table and table.get("phase") == "playing" and remaining_at_receive is not None:
+            # Server-provided relative seconds, aged locally since receipt —
+            # avoids comparing the master's clock with this machine's clock.
+            received = self.table_received_at.get(self.table_id.get(), time.time())
+            remaining = max(0, int(remaining_at_receive - (time.time() - received)))
             self.turn_timer_status.set(f"Turn timer: {table.get('current_player_id', '-')} - {remaining}s left")
         else:
             self.turn_timer_status.set("Turn timer: -")
@@ -630,13 +644,25 @@ class BlackjackControlPanel(tk.Tk):
                 return table
         return None
 
+    def snapshot_outdated(self, table: dict, strict: bool = False) -> bool:
+        """Single staleness gate for poll and action responses.
+
+        A different lineage means the cluster replaced the table (fork
+        resolution or restart) — always accept it, version counters of
+        different lineages are not comparable.
+        """
+        cached = self.known_tables.get(table.get("table_id"))
+        if not cached or cached.get("lineage") != table.get("lineage"):
+            return False
+        if strict:
+            return table.get("state_version", 0) <= cached.get("state_version", 0)
+        return table.get("state_version", 0) < cached.get("state_version", 0)
+
     def handle_poll_draw(self, table: dict) -> None:
-        table_id = table.get("table_id")
-        cached = self.known_tables.get(table_id)
-        if cached and cached.get("state_version", 0) >= table.get("state_version", 0):
+        if self.snapshot_outdated(table, strict=True):
             return
         self.update_tables_panel([table])
-        if table_id == self.table_id.get():
+        if table.get("table_id") == self.table_id.get():
             self.draw_table(table)
 
     def announce_round_finished_once(self, table: dict) -> None:
@@ -679,8 +705,7 @@ class BlackjackControlPanel(tk.Tk):
 
         table = self.extract_table(response)
         if table:
-            cached = self.known_tables.get(table.get("table_id"))
-            if cached and cached.get("state_version", 0) > table.get("state_version", 0):
+            if self.snapshot_outdated(table):
                 return
             self.log_queue.put(("UPDATE_TABLES", [table]))
             actions = self.new_actions(table)
