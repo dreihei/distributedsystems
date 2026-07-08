@@ -24,6 +24,7 @@ SERVER_PRESETS = {
     3: {"client_port": 9003, "server_port": 9103},
 }
 ACTION_REPLAY_DELAY_MS = 1800
+TABLE_POLL_INTERVAL_MS = 2000
 
 
 class ServerProcess:
@@ -116,10 +117,14 @@ class BlackjackControlPanel(tk.Tk):
         self.tables_panel_content: ttk.Frame | None = None
         self.tables_toggle_btn: ttk.Button | None = None
 
+        self._poll_in_flight = False
+        self.announced_finished_versions: dict[str, int] = {}
+
         self.build_layout()
         self.after(500, self.refresh_status)
         self.after(200, self.drain_log_queue)
         self.after(1000, self.tick_turn_timer)
+        self.after(TABLE_POLL_INTERVAL_MS, self.poll_table_state)
 
     def build_layout(self) -> None:
         outer = ttk.Frame(self, padding=0)
@@ -586,6 +591,55 @@ class BlackjackControlPanel(tk.Tk):
             self.turn_timer_status.set("Turn timer: -")
         self.after(1000, self.tick_turn_timer)
 
+    def poll_table_state(self) -> None:
+        if not self._poll_in_flight and not self.animation_running and self.table_id.get():
+            self._poll_in_flight = True
+            threading.Thread(target=self.poll_table_state_worker, args=(self.table_id.get(),), daemon=True).start()
+        self.after(TABLE_POLL_INTERVAL_MS, self.poll_table_state)
+
+    def poll_table_state_worker(self, table_id: str) -> None:
+        try:
+            for port in self.command_ports():
+                try:
+                    response = asyncio.run(send(self.server_host.get(), port, "LIST_TABLES", {"table_id": table_id}))
+                except OSError:
+                    continue
+                table = self.find_table_in_response(response, table_id)
+                if table:
+                    self.log_queue.put(("POLL_DRAW", table))
+                return
+        finally:
+            self._poll_in_flight = False
+
+    def find_table_in_response(self, response: dict, table_id: str) -> dict | None:
+        for table in response.get("tables", []):
+            if table.get("table_id") == table_id:
+                return table
+        return None
+
+    def handle_poll_draw(self, table: dict) -> None:
+        table_id = table.get("table_id")
+        cached = self.known_tables.get(table_id)
+        if cached and cached.get("state_version") == table.get("state_version"):
+            return
+        self.update_tables_panel([table])
+        if table_id == self.table_id.get():
+            self.draw_table(table)
+
+    def announce_round_finished_once(self, table: dict) -> None:
+        if table.get("phase") != "finished":
+            return
+        table_id = table.get("table_id")
+        version = table.get("state_version")
+        if self.announced_finished_versions.get(table_id) == version:
+            return
+        self.announced_finished_versions[table_id] = version
+        if self.player_id.get() not in table.get("players", {}):
+            return
+        self.check_empty_balance(table)
+        if table.get("last_result"):
+            self.show_next_round_popup()
+
     def drain_log_queue(self) -> None:
         while not self.log_queue.empty():
             item = self.log_queue.get()
@@ -595,6 +649,8 @@ class BlackjackControlPanel(tk.Tk):
                 self.play_action_sequence(item[1], item[2])
             elif isinstance(item, tuple) and item[0] == "UPDATE_TABLES":
                 self.update_tables_panel(item[1])
+            elif isinstance(item, tuple) and item[0] == "POLL_DRAW":
+                self.handle_poll_draw(item[1])
             else:
                 self.log(item)
         self.after(200, self.drain_log_queue)
@@ -697,8 +753,6 @@ class BlackjackControlPanel(tk.Tk):
             self.draw_table(table, show_result=True)
             self.action_status.set("Actions: completed")
             self.set_gameplay_buttons_enabled(table.get("phase") != "finished")
-            if table.get("phase") == "finished" and table.get("last_result"):
-                self.show_next_round_popup()
             return
         action = actions[index]
         message = action.get("message", "updated")
@@ -807,7 +861,7 @@ class BlackjackControlPanel(tk.Tk):
 
         self.update_gameplay_buttons(table)
         if show_result:
-            self.check_empty_balance(table)
+            self.announce_round_finished_once(table)
 
     def update_status_labels(self, table: dict[str, Any]) -> None:
         self.cluster_status.set(
