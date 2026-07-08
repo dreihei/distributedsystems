@@ -61,6 +61,16 @@ def parse_args() -> argparse.Namespace:
     stand = sub.add_parser("stand")
     stand.add_argument("--player-id", required=True)
 
+    double = sub.add_parser("double")
+    double.add_argument("--player-id", required=True)
+
+    split = sub.add_parser("split")
+    split.add_argument("--player-id", required=True)
+
+    refill = sub.add_parser("refill")
+    refill.add_argument("--player-id", required=True)
+    refill.add_argument("--amount", type=int, default=1000)
+
     return parser.parse_args()
 
 
@@ -78,6 +88,9 @@ def to_message(args: argparse.Namespace) -> tuple[str, dict]:
         "new-round": lambda: ("NEW_ROUND", base | {"player_id": args.player_id, "amount": args.amount}),
         "hit": lambda: ("HIT", base | {"player_id": args.player_id}),
         "stand": lambda: ("STAND", base | {"player_id": args.player_id}),
+        "double": lambda: ("DOUBLE", base | {"player_id": args.player_id}),
+        "split": lambda: ("SPLIT", base | {"player_id": args.player_id}),
+        "refill": lambda: ("REFILL_BALANCE", base | {"player_id": args.player_id, "amount": args.amount}),
     }
     return builders[args.command]()
 

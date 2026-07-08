@@ -208,7 +208,7 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.refill(message.payload["player_id"])
+        table.refill(message.payload["player_id"], int(message.payload.get("amount", 1000)))
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
