@@ -211,8 +211,8 @@ class Table:
                 player.stood = True
                 self.record_player_action(player, "blackjack")
         self.play_bots()
-        if self.all_players_done() and self.phase == "playing":
-            self.finish_dealer()
+        self.advance_turn()
+        if self.phase != "playing":
             return
         self.bump()
 
@@ -334,6 +334,7 @@ class Table:
             if hand_value(player.split_hand) == 21:
                 player.split_stood = True
                 player.stood = True
+                self.advance_turn()
             else:
                 player.on_split_hand = True
         self.play_bots()

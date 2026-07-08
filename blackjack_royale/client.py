@@ -36,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     sub.add_parser("tables")
 
     join = sub.add_parser("join")
+    join.add_argument("--player-id")
     join.add_argument("--name", required=True)
 
     bot = sub.add_parser("add-bot")
@@ -77,7 +78,10 @@ def to_message(args: argparse.Namespace) -> tuple[str, dict]:
     base = {"table_id": args.table}
     builders = {
         "tables": lambda: ("LIST_TABLES", base),
-        "join": lambda: ("JOIN_TABLE", base | {"name": args.name}),
+        "join": lambda: (
+            "JOIN_TABLE",
+            base | ({"player_id": args.player_id} if args.player_id else {}) | {"name": args.name},
+        ),
         "add-bot": lambda: (
             "ADD_BOT",
             base | {"name": args.name, "amount": args.amount} | ({"bot_id": args.bot_id} if args.bot_id else {}),
@@ -108,7 +112,7 @@ async def async_main() -> None:
         args.host = servers[0].host
         args.port = servers[0].client_port
     if args.host is None:
-        args.host = "localhost"
+        args.host = "127.0.0.1"
     message_type, payload = to_message(args)
     print_response(await send(args.host, args.port, message_type, payload))
 

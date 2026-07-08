@@ -1,5 +1,6 @@
 import time
 import unittest
+import unittest.mock
 
 from blackjack_royale.blackjack import Card, Table, hand_value, is_blackjack, is_bust
 
@@ -147,6 +148,56 @@ class BlackjackRulesTest(unittest.TestCase):
 
         self.assertEqual(table.phase, "finished")
         self.assertIsNone(table.turn_deadline)
+
+    def test_split_both_hands_21_advances_turn(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        p1 = table.join("p1", "Alice")
+        p2 = table.join("p2", "Bertha")
+        table.phase = "playing"
+        p1.hand = [Card("K", "spades"), Card("K", "hearts")]
+        p1.bet = 50
+        p2.stood = False
+        table.current_player_index = 0
+        table.deck = [Card("A", "diamonds"), Card("A", "clubs")]
+
+        table.split("p1")
+
+        self.assertTrue(p1.stood)
+        self.assertTrue(p1.split_stood)
+        self.assertEqual(table.current_player_index, 1)
+        self.assertEqual(table.current_player().player_id, "p2")
+
+    def test_start_round_skips_natural_blackjack_at_index_zero(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        table.join("p1", "Alice")
+        table.join("p2", "Bertha")
+        table.place_bet("p1", 50)
+        table.place_bet("p2", 50)
+        fixed_deck = [
+            Card("7", "diamonds"), Card("4", "diamonds"),
+            Card("K", "hearts"), Card("A", "spades"),
+            Card("3", "clubs"), Card("2", "clubs"),
+        ]
+        with unittest.mock.patch("blackjack_royale.blackjack.new_deck", side_effect=lambda: list(fixed_deck)):
+            table.start_round()
+
+        self.assertTrue(table.players["p1"].stood)
+        self.assertEqual(table.phase, "playing")
+        self.assertEqual(table.current_player().player_id, "p2")
+        self.assertEqual(table.snapshot()["current_player_id"], "p2")
+
+    def test_rejoin_with_existing_player_id_preserves_state(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        player = table.join("p1", "Alice")
+        player.balance = 750
+        player.hand = [Card("9", "clubs"), Card("2", "hearts")]
+
+        reconnected = table.join("p1", "Alice")
+
+        self.assertIs(reconnected, player)
+        self.assertEqual(reconnected.balance, 750)
+        self.assertEqual(len(reconnected.hand), 2)
+        self.assertEqual(len(table.players), 1)
 
 
 if __name__ == "__main__":

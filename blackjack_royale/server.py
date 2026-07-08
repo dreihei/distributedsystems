@@ -14,6 +14,7 @@ import json
 import time
 from typing import Awaitable, Callable
 
+from .blackjack import Table
 from .config import DEFAULT_CONFIG, RuntimeConfig
 from .discovery import DISCOVERY_REQUEST, DISCOVERY_RESPONSE, local_lan_ip
 from .messages import Message, read_message, send_message
@@ -173,6 +174,12 @@ class BlackjackServer:
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
+    def enforce_turn(self, table: Table, player_id: str) -> dict | None:
+        current = table.current_player()
+        if current is None or player_id != current.player_id:
+            return {"error": "not your turn", "table": table.snapshot()}
+        return None
+
     async def client_hit(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
@@ -182,6 +189,9 @@ class BlackjackServer:
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
         table.hit(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
@@ -195,6 +205,9 @@ class BlackjackServer:
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
         table.stand(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
@@ -208,6 +221,9 @@ class BlackjackServer:
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
         table.double(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
@@ -221,6 +237,9 @@ class BlackjackServer:
         player_id = message.payload.get("player_id")
         if not player_id:
             return {"error": "player_id required", "table": table.snapshot()}
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
         table.split(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
@@ -271,7 +290,7 @@ class BlackjackServer:
         payload = self.state.local_peer().__dict__
         for port in self.nearby_peer_ports():
             if port != self.config.server_port:
-                response = await self.request("localhost", port, Message("SERVER_ANNOUNCE", str(self.state.server_id), payload))
+                response = await self.request("127.0.0.1", port, Message("SERVER_ANNOUNCE", str(self.state.server_id), payload))
                 self.learn_from_response(response)
 
     async def start_udp_discovery(self) -> None:
