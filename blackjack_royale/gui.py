@@ -96,7 +96,7 @@ class BlackjackControlPanel(tk.Tk):
 
         self.selected_port = tk.IntVar(value=9003)
         self.server_host = tk.StringVar(value="localhost")
-        self.player_id = tk.StringVar(value="p1")
+        self.player_id = tk.StringVar(value="")
         self.player_name = tk.StringVar(value="Sergej")
         self.bot_name = tk.StringVar(value="DealerBot")
         self.bet_amount = tk.IntVar(value=50)
@@ -106,6 +106,7 @@ class BlackjackControlPanel(tk.Tk):
         self.player_status = tk.StringVar(value="You: -")
         self.bot_status = tk.StringVar(value="Bots: -")
         self.round_status = tk.StringVar(value="Round: no table loaded")
+        self.turn_timer_status = tk.StringVar(value="Turn timer: -")
         self.action_status = tk.StringVar(value="Actions: waiting")
         self.command_buttons: dict[str, ttk.Button] = {}
         self.action_history: tk.Text | None = None
@@ -118,6 +119,7 @@ class BlackjackControlPanel(tk.Tk):
         self.build_layout()
         self.after(500, self.refresh_status)
         self.after(200, self.drain_log_queue)
+        self.after(1000, self.tick_turn_timer)
 
     def build_layout(self) -> None:
         outer = ttk.Frame(self, padding=0)
@@ -274,6 +276,7 @@ class BlackjackControlPanel(tk.Tk):
         labels = [
             self.cluster_status,
             self.round_status,
+            self.turn_timer_status,
             self.dealer_status,
             self.player_status,
             self.bot_status,
@@ -300,7 +303,11 @@ class BlackjackControlPanel(tk.Tk):
         frame = ttk.LabelFrame(parent, text="Player")
         frame.pack(fill="x", pady=(0, 6), padx=4)
 
-        self.add_entry(frame, "Player ID", self.player_id)
+        id_cell = ttk.Frame(frame)
+        id_cell.pack(fill="x", padx=6, pady=2)
+        ttk.Label(id_cell, text="Player ID (assigned on join)").pack(anchor="w")
+        ttk.Label(id_cell, textvariable=self.player_id, foreground="#0a6").pack(anchor="w")
+
         self.add_entry(frame, "Name", self.player_name)
         self.add_entry(frame, "Bet", self.bet_amount)
 
@@ -454,7 +461,7 @@ class BlackjackControlPanel(tk.Tk):
             self.selected_port.set(servers[0].client_port)
 
     def join_table(self) -> None:
-        self.run_client_command("JOIN_TABLE", self.base_player_payload() | {"name": self.player_name.get()})
+        self.run_client_command("JOIN_TABLE", {"table_id": self.table_id.get(), "name": self.player_name.get()})
 
     def add_bot(self) -> None:
         payload = {
@@ -495,10 +502,7 @@ class BlackjackControlPanel(tk.Tk):
 
     def demo_sequence(self) -> None:
         steps = [
-            ("JOIN_TABLE", self.base_player_payload() | {"name": self.player_name.get()}),
-            ("PLACE_BET", self.base_player_payload() | {"amount": self.bet_amount.get()}),
-            ("START_ROUND", {"table_id": self.table_id.get()}),
-            ("LIST_TABLES", {"table_id": self.table_id.get()}),
+            ("JOIN_TABLE", {"table_id": self.table_id.get(), "name": self.player_name.get()}),
         ]
         threading.Thread(target=self.run_demo_steps, args=(steps,), daemon=True).start()
 
@@ -506,6 +510,12 @@ class BlackjackControlPanel(tk.Tk):
         for message_type, payload in steps:
             self.send_and_log(message_type, payload)
             time.sleep(0.3)
+            if message_type == "JOIN_TABLE":
+                self.send_and_log("PLACE_BET", self.base_player_payload() | {"amount": self.bet_amount.get()})
+                time.sleep(0.3)
+                self.send_and_log("START_ROUND", {"table_id": self.table_id.get()})
+                time.sleep(0.3)
+                self.send_and_log("LIST_TABLES", {"table_id": self.table_id.get()})
 
     def run_client_command(self, message_type: str, payload: dict) -> None:
         threading.Thread(target=self.send_and_log, args=(message_type, payload), daemon=True).start()
@@ -515,10 +525,15 @@ class BlackjackControlPanel(tk.Tk):
         try:
             response = asyncio.run(send(self.server_host.get(), ports[0], message_type, payload))
             formatted = json.dumps(response, indent=2)
+            self.apply_assigned_player_id(message_type, response)
             self.queue_table_draw(response, message_type)
             self.log_queue.put(f"> {message_type} on port {ports[0]}\n{formatted}")
         except OSError as exc:
             self.try_fallback_ports(message_type, payload, ports[1:], exc)
+
+    def apply_assigned_player_id(self, message_type: str, response: dict) -> None:
+        if message_type == "JOIN_TABLE" and response.get("player_id"):
+            self.player_id.set(response["player_id"])
 
     def command_ports(self) -> list[int]:
         selected = self.selected_port.get()
@@ -535,6 +550,7 @@ class BlackjackControlPanel(tk.Tk):
                 response = asyncio.run(send(self.server_host.get(), port, message_type, payload))
                 formatted = json.dumps(response, indent=2)
                 self.selected_port.set(port)
+                self.apply_assigned_player_id(message_type, response)
                 self.queue_table_draw(response, message_type)
                 self.log_queue.put(f"> {message_type} on fallback port {port}\n{formatted}")
                 return
@@ -560,6 +576,15 @@ class BlackjackControlPanel(tk.Tk):
 
     def server_ports_in_use(self, server: ServerProcess) -> bool:
         return not self.tcp_port_available(server.client_port) or not self.tcp_port_available(server.server_port)
+
+    def tick_turn_timer(self) -> None:
+        table = self.known_tables.get(self.table_id.get())
+        if table and table.get("phase") == "playing" and table.get("turn_deadline"):
+            remaining = max(0, int(table["turn_deadline"] - time.time()))
+            self.turn_timer_status.set(f"Turn timer: {table.get('current_player_id', '-')} - {remaining}s left")
+        else:
+            self.turn_timer_status.set("Turn timer: -")
+        self.after(1000, self.tick_turn_timer)
 
     def drain_log_queue(self) -> None:
         while not self.log_queue.empty():

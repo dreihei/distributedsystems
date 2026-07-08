@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass, field
 
 SUITS = ("hearts", "diamonds", "clubs", "spades")
@@ -122,16 +123,25 @@ class Table:
     last_result: dict | None = None
     dealer_action: str = "waiting"
     action_log: list[dict] = field(default_factory=list)
+    turn_timeout: float = 30.0
+    turn_deadline: float | None = None
 
-    def join(self, player_id: str, name: str, is_bot: bool = False) -> Player:
-        player = self.players.get(player_id)
-        if player:
+    def join(self, player_id: str | None = None, name: str = "Player", is_bot: bool = False) -> Player:
+        if player_id and player_id in self.players:
+            player = self.players[player_id]
             player.connected = True
             return player
+        player_id = player_id or self.next_player_id()
         player = Player(player_id=player_id, name=name, is_bot=is_bot)
         self.players[player_id] = player
         self.bump()
         return player
+
+    def next_player_id(self) -> str:
+        index = 1
+        while f"p{index}" in self.players:
+            index += 1
+        return f"p{index}"
 
     def place_bet(self, player_id: str, amount: int) -> None:
         player = self.players[player_id]
@@ -548,6 +558,14 @@ class Table:
 
     def bump(self) -> None:
         self.state_version += 1
+        self._refresh_turn_deadline()
+
+    def _refresh_turn_deadline(self) -> None:
+        current = self.current_player()
+        if self.phase == "playing" and current is not None and not current.is_bot:
+            self.turn_deadline = time.time() + self.turn_timeout
+        else:
+            self.turn_deadline = None
 
     def snapshot(self) -> dict:
         current = self.current_player()
@@ -557,6 +575,8 @@ class Table:
             "phase": self.phase,
             "state_version": self.state_version,
             "current_player_id": current.player_id if current and self.phase == "playing" else None,
+            "turn_deadline": self.turn_deadline,
+            "turn_timeout": self.turn_timeout,
             "dealer_hand": [card.label() for card in self.dealer_hand],
             "dealer_value": hand_value(self.dealer_hand),
             "dealer_action": self.dealer_action,
@@ -596,6 +616,8 @@ class Table:
             "last_result": self.last_result,
             "dealer_action": self.dealer_action,
             "action_log": self.action_log,
+            "turn_timeout": self.turn_timeout,
+            "turn_deadline": self.turn_deadline,
         }
 
     @staticmethod
@@ -610,4 +632,6 @@ class Table:
         table.last_result = raw.get("last_result")
         table.dealer_action = raw.get("dealer_action", "waiting")
         table.action_log = raw.get("action_log", [])
+        table.turn_timeout = raw.get("turn_timeout", 30.0)
+        table.turn_deadline = raw.get("turn_deadline")
         return table

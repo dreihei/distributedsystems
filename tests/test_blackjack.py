@@ -1,3 +1,4 @@
+import time
 import unittest
 
 from blackjack_royale.blackjack import Card, Table, hand_value, is_blackjack, is_bust
@@ -105,6 +106,47 @@ class BlackjackRulesTest(unittest.TestCase):
 
         self.assertGreaterEqual(table.last_result["dealer_value"], 18)
         self.assertIn(table.last_result["dealer_action"], {"stand", "bust"})
+
+    def test_join_without_player_id_assigns_sequential_ids(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+
+        first = table.join(None, "Sergej")
+        second = table.join(None, "Maxime")
+
+        self.assertEqual(first.player_id, "p1")
+        self.assertEqual(second.player_id, "p2")
+        self.assertEqual(len(table.players), 2)
+
+    def test_join_with_explicit_player_id_still_works(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+
+        player = table.join("custom", "Sergej")
+
+        self.assertEqual(player.player_id, "custom")
+        self.assertIn("custom", table.players)
+
+    def test_turn_deadline_is_set_for_active_human_player(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        table.join("p1", "Sergej")
+        table.place_bet("p1", 50)
+
+        self.assertEqual(table.turn_timeout, 30.0)
+        before = time.time()
+        table.start_round()
+
+        self.assertIsNotNone(table.turn_deadline)
+        self.assertAlmostEqual(table.turn_deadline, before + table.turn_timeout, delta=2)
+
+    def test_turn_deadline_clears_once_round_finished(self) -> None:
+        table = Table(table_id="main", game_master_id=3)
+        table.join("p1", "Sergej")
+        table.place_bet("p1", 50)
+        table.start_round()
+
+        table.stand("p1")
+
+        self.assertEqual(table.phase, "finished")
+        self.assertIsNone(table.turn_deadline)
 
 
 if __name__ == "__main__":

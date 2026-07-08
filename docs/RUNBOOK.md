@@ -22,6 +22,8 @@ Dann:
 
 Die grafische Anzeige zeigt oben den Dealer, darunter deine eigene Hand und darunter/nebendran Bots. In der Statuszeile stehen Dealer-Wert, eigener Wert, Einsatz, Kontostand und Bot-Werte.
 
+Die Spieler-ID wird beim `Join Table` automatisch vom Server vergeben (z.B. `p1`) und in der Player-Sektion angezeigt - es gibt kein manuelles ID-Feld mehr. Reagiert ein Spieler laenger als 30 Sekunden (konfigurierbar ueber `turn_timeout` in `config.py`) nicht auf seinen Zug, setzt der Server automatisch "Stand" fuer ihn; die verbleibende Zeit steht in der Statuszeile "Turn timer".
+
 ## Im gleichen Netzwerk spielen
 
 Auf dem Host-Rechner Server starten:
@@ -40,7 +42,7 @@ Wenn ein Server gefunden wird, kann man direkt ohne feste IP spielen:
 
 ```powershell
 python -m blackjack_royale.client tables
-python -m blackjack_royale.client join --player-id p2 --name Maxime
+python -m blackjack_royale.client join --name Maxime
 ```
 
 In der GUI:
@@ -74,7 +76,12 @@ python -m blackjack_royale.server --id 3 --client-port 9003 --server-port 9103
 Terminal 4:
 
 ```powershell
-python -m blackjack_royale.client --port 9003 join --player-id p1 --name Sergej
+python -m blackjack_royale.client --port 9003 join --name Sergej
+```
+
+Die Antwort enthaelt die vom Server zugewiesene `player_id` (z.B. `p1`); diese fuer die folgenden Befehle einsetzen:
+
+```powershell
 python -m blackjack_royale.client --port 9003 bet --player-id p1 --amount 50
 python -m blackjack_royale.client --port 9003 start
 python -m blackjack_royale.client --port 9003 tables

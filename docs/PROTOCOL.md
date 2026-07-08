@@ -23,8 +23,16 @@ Alle Nachrichten werden als eine JSON-Zeile ueber TCP gesendet.
 
 `JOIN_TABLE`
 
+`player_id` wird nicht mehr vom Client vergeben, sondern automatisch vom Server (z.B. `p1`, `p2`, ...).
+
 ```json
-{"table_id": "main", "player_id": "p1", "name": "Sergej"}
+{"table_id": "main", "name": "Sergej"}
+```
+
+Die Antwort enthaelt die zugewiesene ID, die fuer alle weiteren Nachrichten (PLACE_BET, HIT, ...) verwendet werden muss:
+
+```json
+{"table": {...}, "player_id": "p1"}
 ```
 
 `ADD_BOT`
@@ -79,7 +87,9 @@ Lebensmeldung zwischen Servern.
 
 `STATE_SYNC`
 
-Game Master repliziert Tabellenzustand.
+Game Master repliziert Tabellenzustand. Enthaelt u.a. `turn_deadline` (Unix-Timestamp, wann der aktuelle
+menschliche Spieler automatisch "Stand" gesetzt wird) und `turn_timeout` (konfigurierte Dauer in Sekunden,
+Standard 30s).
 
 `ELECTION`
 

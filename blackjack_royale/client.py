@@ -36,7 +36,6 @@ def parse_args() -> argparse.Namespace:
     sub.add_parser("tables")
 
     join = sub.add_parser("join")
-    join.add_argument("--player-id", required=True)
     join.add_argument("--name", required=True)
 
     bot = sub.add_parser("add-bot")
@@ -78,7 +77,7 @@ def to_message(args: argparse.Namespace) -> tuple[str, dict]:
     base = {"table_id": args.table}
     builders = {
         "tables": lambda: ("LIST_TABLES", base),
-        "join": lambda: ("JOIN_TABLE", base | {"player_id": args.player_id, "name": args.name}),
+        "join": lambda: ("JOIN_TABLE", base | {"name": args.name}),
         "add-bot": lambda: (
             "ADD_BOT",
             base | {"name": args.name, "amount": args.amount} | ({"bot_id": args.bot_id} if args.bot_id else {}),

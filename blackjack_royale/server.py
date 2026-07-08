@@ -57,7 +57,9 @@ class BlackjackServer:
         advertised_host = local_lan_ip() if host in {"0.0.0.0", ""} else host
         self.config = RuntimeConfig(host=host, client_port=client_port, server_port=server_port)
         self.discovery_port = discovery_port
-        self.state = ClusterState(server_id, advertised_host, server_port, client_port)
+        self.state = ClusterState(
+            server_id, advertised_host, server_port, client_port, turn_timeout=self.config.turn_timeout
+        )
         self.election_running = False
         self._tasks: list[asyncio.Task] = []
 
@@ -68,6 +70,7 @@ class BlackjackServer:
         self._tasks = [
             asyncio.create_task(self.discovery_loop()),
             asyncio.create_task(self.heartbeat_loop()),
+            asyncio.create_task(self.turn_timer_loop()),
         ]
         print(
             f"server {self.state.server_id} running "
@@ -126,9 +129,9 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.join(message.payload["player_id"], message.payload["name"])
+        player = table.join(message.payload.get("player_id"), message.payload.get("name", "Player"))
         await self.sync_table(table.table_id)
-        return {"table": table.snapshot()}
+        return {"table": table.snapshot(), "player_id": player.player_id}
 
     async def client_add_bot(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
@@ -143,7 +146,10 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.place_bet(message.payload["player_id"], int(message.payload["amount"]))
+        player_id = message.payload.get("player_id")
+        if not player_id:
+            return {"error": "player_id required", "table": table.snapshot()}
+        table.place_bet(player_id, int(message.payload["amount"]))
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -159,7 +165,10 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.place_bet(message.payload["player_id"], int(message.payload["amount"]))
+        player_id = message.payload.get("player_id")
+        if not player_id:
+            return {"error": "player_id required", "table": table.snapshot()}
+        table.place_bet(player_id, int(message.payload["amount"]))
         table.start_round()
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
@@ -170,7 +179,10 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
-        table.hit(message.payload["player_id"])
+        player_id = message.payload.get("player_id")
+        if not player_id:
+            return {"error": "player_id required", "table": table.snapshot()}
+        table.hit(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -180,7 +192,10 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
-        table.stand(message.payload["player_id"])
+        player_id = message.payload.get("player_id")
+        if not player_id:
+            return {"error": "player_id required", "table": table.snapshot()}
+        table.stand(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -190,7 +205,10 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round not active", "table": table.snapshot()}
-        table.double(message.payload["player_id"])
+        player_id = message.payload.get("player_id")
+        if not player_id:
+            return {"error": "player_id required", "table": table.snapshot()}
+        table.double(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -200,7 +218,10 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round not active", "table": table.snapshot()}
-        table.split(message.payload["player_id"])
+        player_id = message.payload.get("player_id")
+        if not player_id:
+            return {"error": "player_id required", "table": table.snapshot()}
+        table.split(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -208,7 +229,10 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.refill(message.payload["player_id"], int(message.payload.get("amount", 1000)))
+        player_id = message.payload.get("player_id")
+        if not player_id:
+            return {"error": "player_id required", "table": table.snapshot()}
+        table.refill(player_id, int(message.payload.get("amount", 1000)))
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -282,6 +306,23 @@ class BlackjackServer:
             master_missing = master != self.state.server_id and (peer is None or now - peer.last_seen > self.config.heartbeat_timeout)
             if master_missing:
                 await self.run_election()
+
+    async def turn_timer_loop(self) -> None:
+        while True:
+            await self.expire_overdue_turns()
+            await asyncio.sleep(1.0)
+
+    async def expire_overdue_turns(self) -> None:
+        now = time.time()
+        for table_id, table in list(self.state.tables.items()):
+            if not self.is_game_master(table_id):
+                continue
+            if table.phase != "playing" or table.turn_deadline is None or now < table.turn_deadline:
+                continue
+            current = table.current_player()
+            if current is not None:
+                table.stand(current.player_id)
+                await self.sync_table(table_id)
 
     async def run_election(self) -> None:
         if self.election_running:
