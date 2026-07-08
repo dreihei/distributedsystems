@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import random
+import time
 from dataclasses import dataclass, field
 
 SUITS = ("hearts", "diamonds", "clubs", "spades")
 RANKS = ("A", "2", "3", "4", "5", "6", "7", "8", "9", "10", "J", "Q", "K")
+TURN_DURATION_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -118,6 +120,7 @@ class Table:
     players: dict[str, Player] = field(default_factory=dict)
     dealer_hand: list[Card] = field(default_factory=list)
     current_player_index: int = 0
+    turn_deadline: float | None = None
     state_version: int = 0
     last_result: dict | None = None
     dealer_action: str = "waiting"
@@ -145,6 +148,21 @@ class Table:
         while f"bot{index}" in self.players:
             index += 1
         return f"bot{index}"
+
+    def next_player_id(self) -> str:
+        index = 1
+        while f"p{index}" in self.players:
+            index += 1
+        return f"p{index}"
+
+    def start_turn_timer(self) -> None:
+        self.turn_deadline = time.time() + TURN_DURATION_SECONDS
+
+    def timeout_current_player(self) -> None:
+        current = self.current_player()
+        if current is None:
+            return
+        self.stand(current.player_id)
 
     def add_bot(self, bot_id: str | None = None, name: str = "Bot", default_bet: int = 50) -> Player:
         bot_id = bot_id or self.next_bot_id()
@@ -201,8 +219,8 @@ class Table:
                 player.stood = True
                 self.record_player_action(player, "blackjack")
         self.play_bots()
-        if self.all_players_done() and self.phase == "playing":
-            self.finish_dealer()
+        self.advance_turn()
+        if self.phase != "playing":
             return
         self.bump()
 
@@ -235,6 +253,7 @@ class Table:
             elif value == 21:
                 if player.split_hand:
                     player.on_split_hand = True
+                    self.start_turn_timer()
                 else:
                     player.stood = True
                     self.record_player_action(player, "stand")
@@ -260,6 +279,8 @@ class Table:
                 player.split_stood = True
                 player.stood = True
                 self.advance_turn()
+            else:
+                self.start_turn_timer()
         else:
             player.stood = True
             self.record_player_action(player, "stand")
@@ -299,6 +320,8 @@ class Table:
                     player.split_stood = True
                     player.stood = True
                     self.advance_turn()
+                else:
+                    self.start_turn_timer()
             else:
                 player.stood = True
                 if is_bust(player.hand):
@@ -324,8 +347,12 @@ class Table:
             if hand_value(player.split_hand) == 21:
                 player.split_stood = True
                 player.stood = True
+                self.advance_turn()
             else:
                 player.on_split_hand = True
+                self.start_turn_timer()
+        else:
+            self.start_turn_timer()
         self.play_bots()
         if self.all_players_done() and self.phase == "playing":
             self.finish_dealer()
@@ -419,6 +446,8 @@ class Table:
             self.current_player_index += 1
         if self.current_player_index >= len(active):
             self.finish_dealer()
+        else:
+            self.start_turn_timer()
 
     def settle_bets(self) -> None:
         dealer_score = hand_value(self.dealer_hand)
@@ -557,6 +586,7 @@ class Table:
             "phase": self.phase,
             "state_version": self.state_version,
             "current_player_id": current.player_id if current and self.phase == "playing" else None,
+            "turn_deadline": self.turn_deadline if self.phase == "playing" else None,
             "dealer_hand": [card.label() for card in self.dealer_hand],
             "dealer_value": hand_value(self.dealer_hand),
             "dealer_action": self.dealer_action,
@@ -592,6 +622,7 @@ class Table:
             "players": {pid: player.to_dict() for pid, player in self.players.items()},
             "dealer_hand": [card.to_dict() for card in self.dealer_hand],
             "current_player_index": self.current_player_index,
+            "turn_deadline": self.turn_deadline,
             "state_version": self.state_version,
             "last_result": self.last_result,
             "dealer_action": self.dealer_action,
@@ -606,6 +637,7 @@ class Table:
         table.players = {pid: Player.from_dict(player) for pid, player in raw["players"].items()}
         table.dealer_hand = [Card.from_dict(card) for card in raw["dealer_hand"]]
         table.current_player_index = raw["current_player_index"]
+        table.turn_deadline = raw.get("turn_deadline")
         table.state_version = raw["state_version"]
         table.last_result = raw.get("last_result")
         table.dealer_action = raw.get("dealer_action", "waiting")

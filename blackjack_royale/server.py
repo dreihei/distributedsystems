@@ -14,6 +14,7 @@ import json
 import time
 from typing import Awaitable, Callable
 
+from .blackjack import Table
 from .config import DEFAULT_CONFIG, RuntimeConfig
 from .discovery import DISCOVERY_REQUEST, DISCOVERY_RESPONSE, local_lan_ip
 from .messages import Message, read_message, send_message
@@ -68,6 +69,7 @@ class BlackjackServer:
         self._tasks = [
             asyncio.create_task(self.discovery_loop()),
             asyncio.create_task(self.heartbeat_loop()),
+            asyncio.create_task(self.turn_timeout_loop()),
         ]
         print(
             f"server {self.state.server_id} running "
@@ -126,9 +128,17 @@ class BlackjackServer:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
         if not self.is_game_master(table.table_id):
             return await self.forward_to_master(message, table.table_id)
-        table.join(message.payload["player_id"], message.payload["name"])
+        requested_id = (message.payload.get("player_id") or "").strip()
+        player_id = requested_id or table.next_player_id()
+        table.join(player_id, message.payload["name"])
         await self.sync_table(table.table_id)
-        return {"table": table.snapshot()}
+        return {"player_id": player_id, "table": table.snapshot()}
+
+    def enforce_turn(self, table: Table, player_id: str) -> dict | None:
+        current = table.current_player()
+        if current is None or player_id != current.player_id:
+            return {"error": "not your turn", "table": table.snapshot()}
+        return None
 
     async def client_add_bot(self, message: Message) -> dict:
         table = self.state.ensure_table(message.payload.get("table_id", "main"))
@@ -170,7 +180,11 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
-        table.hit(message.payload["player_id"])
+        player_id = message.payload["player_id"]
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
+        table.hit(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -180,7 +194,11 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round is not active; use NEW_ROUND or place a bet and start again", "table": table.snapshot()}
-        table.stand(message.payload["player_id"])
+        player_id = message.payload["player_id"]
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
+        table.stand(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -190,7 +208,11 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round not active", "table": table.snapshot()}
-        table.double(message.payload["player_id"])
+        player_id = message.payload["player_id"]
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
+        table.double(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -200,7 +222,11 @@ class BlackjackServer:
             return await self.forward_to_master(message, table.table_id)
         if table.phase != "playing":
             return {"error": "round not active", "table": table.snapshot()}
-        table.split(message.payload["player_id"])
+        player_id = message.payload["player_id"]
+        guard = self.enforce_turn(table, player_id)
+        if guard is not None:
+            return guard
+        table.split(player_id)
         await self.sync_table(table.table_id)
         return {"table": table.snapshot()}
 
@@ -267,6 +293,25 @@ class BlackjackServer:
             await self.send_heartbeats()
             await self.detect_failed_master()
             await asyncio.sleep(self.config.heartbeat_interval)
+
+    async def turn_timeout_loop(self) -> None:
+        while True:
+            await self.check_turn_timeouts()
+            await asyncio.sleep(1.0)
+
+    async def check_turn_timeouts(self) -> None:
+        now = time.time()
+        for table in list(self.state.tables.values()):
+            if table.game_master_id != self.state.server_id:
+                continue
+            if table.phase != "playing" or table.turn_deadline is None:
+                continue
+            if now <= table.turn_deadline:
+                continue
+            if table.current_player() is None:
+                continue
+            table.timeout_current_player()
+            await self.sync_table(table.table_id)
 
     async def send_heartbeats(self) -> None:
         for peer in list(self.state.peers.values()):

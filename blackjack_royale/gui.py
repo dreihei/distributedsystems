@@ -109,6 +109,10 @@ class BlackjackControlPanel(tk.Tk):
         self.action_status = tk.StringVar(value="Actions: waiting")
         self.command_buttons: dict[str, ttk.Button] = {}
         self.action_history: tk.Text | None = None
+        self.player_id_entry: ttk.Entry | None = None
+        self.turn_status = tk.StringVar(value="Turn: -")
+        self._turn_deadline: float | None = None
+        self._current_player_for_turn: str | None = None
 
         self.known_tables: dict[str, dict] = {}
         self.tables_panel_visible = True
@@ -116,8 +120,11 @@ class BlackjackControlPanel(tk.Tk):
         self.tables_toggle_btn: ttk.Button | None = None
 
         self.build_layout()
+        self.prompt_for_name()
         self.after(500, self.refresh_status)
         self.after(200, self.drain_log_queue)
+        self.after(1000, self.tick_turn_countdown)
+        self.after(1000, self.poll_current_table)
 
     def build_layout(self) -> None:
         outer = ttk.Frame(self, padding=0)
@@ -274,6 +281,7 @@ class BlackjackControlPanel(tk.Tk):
         labels = [
             self.cluster_status,
             self.round_status,
+            self.turn_status,
             self.dealer_status,
             self.player_status,
             self.bot_status,
@@ -300,7 +308,7 @@ class BlackjackControlPanel(tk.Tk):
         frame = ttk.LabelFrame(parent, text="Player")
         frame.pack(fill="x", pady=(0, 6), padx=4)
 
-        self.add_entry(frame, "Player ID", self.player_id)
+        self.player_id_entry = self.add_entry(frame, "Player ID", self.player_id)
         self.add_entry(frame, "Name", self.player_name)
         self.add_entry(frame, "Bet", self.bet_amount)
 
@@ -365,11 +373,13 @@ class BlackjackControlPanel(tk.Tk):
         scrollbar.pack(side="right", fill="y")
         self.output.configure(yscrollcommand=scrollbar.set)
 
-    def add_entry(self, parent: ttk.Frame, label: str, variable: tk.Variable) -> None:
+    def add_entry(self, parent: ttk.Frame, label: str, variable: tk.Variable) -> ttk.Entry:
         cell = ttk.Frame(parent)
         cell.pack(fill="x", padx=6, pady=2)
         ttk.Label(cell, text=label).pack(anchor="w")
-        ttk.Entry(cell, textvariable=variable, width=20).pack(fill="x")
+        entry = ttk.Entry(cell, textvariable=variable, width=20)
+        entry.pack(fill="x")
+        return entry
 
     def start_server(self, server_id: int) -> None:
         server = self.servers[server_id]
@@ -454,7 +464,60 @@ class BlackjackControlPanel(tk.Tk):
             self.selected_port.set(servers[0].client_port)
 
     def join_table(self) -> None:
-        self.run_client_command("JOIN_TABLE", self.base_player_payload() | {"name": self.player_name.get()})
+        self.auto_join()
+
+    def auto_join(self) -> None:
+        self.run_client_command("JOIN_TABLE", {"table_id": self.table_id.get(), "name": self.player_name.get()})
+
+    def prompt_for_name(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Enter your name")
+        dialog.transient(self)
+        dialog.resizable(False, False)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: None)
+
+        ttk.Label(dialog, text="Display name:").pack(padx=16, pady=(16, 4))
+        name_var = tk.StringVar(value=self.player_name.get())
+        entry = ttk.Entry(dialog, textvariable=name_var, width=28)
+        entry.pack(padx=16, pady=4)
+        error_label = ttk.Label(dialog, text="", foreground="red")
+        error_label.pack(padx=16)
+
+        def submit(event: object = None) -> None:
+            name = name_var.get().strip()
+            if not name:
+                error_label.configure(text="Name cannot be empty")
+                return
+            self.player_name.set(name)
+            dialog.grab_release()
+            dialog.destroy()
+            self.auto_join()
+
+        entry.bind("<Return>", submit)
+        ttk.Button(dialog, text="Join", command=submit).pack(pady=(8, 16))
+        dialog.grab_set()
+        entry.focus_set()
+
+    def handle_join_response(self, assigned_id: str) -> None:
+        self.player_id.set(assigned_id)
+        if self.player_id_entry is not None:
+            self.player_id_entry.configure(state="readonly")
+        self.log(f"Joined as {assigned_id}")
+
+    def tick_turn_countdown(self) -> None:
+        if self._turn_deadline is None:
+            self.turn_status.set("Turn: -")
+        else:
+            remaining = max(0, int(self._turn_deadline - time.time()))
+            who = self._current_player_for_turn or "?"
+            label = "you" if who == self.player_id.get() else who
+            self.turn_status.set(f"Turn: {label} - {remaining}s left")
+        self.after(1000, self.tick_turn_countdown)
+
+    def poll_current_table(self) -> None:
+        if not self.animation_running and self.player_id.get() and self.table_id.get():
+            self.run_client_command("LIST_TABLES", {"table_id": self.table_id.get()})
+        self.after(1000, self.poll_current_table)
 
     def add_bot(self) -> None:
         payload = {
@@ -570,6 +633,8 @@ class BlackjackControlPanel(tk.Tk):
                 self.play_action_sequence(item[1], item[2])
             elif isinstance(item, tuple) and item[0] == "UPDATE_TABLES":
                 self.update_tables_panel(item[1])
+            elif isinstance(item, tuple) and item[0] == "JOIN_RESULT":
+                self.handle_join_response(item[1])
             else:
                 self.log(item)
         self.after(200, self.drain_log_queue)
@@ -579,6 +644,9 @@ class BlackjackControlPanel(tk.Tk):
         self.output.see("end")
 
     def queue_table_draw(self, response: dict, message_type: str) -> None:
+        if message_type == "JOIN_TABLE" and "player_id" in response:
+            self.log_queue.put(("JOIN_RESULT", response["player_id"]))
+
         all_tables = response.get("tables", [])
         if all_tables:
             self.log_queue.put(("UPDATE_TABLES", all_tables))
@@ -719,7 +787,10 @@ class BlackjackControlPanel(tk.Tk):
         if "table" in response:
             return response["table"]
         tables = response.get("tables", [])
-        return tables[0] if tables else None
+        if not tables:
+            return None
+        match = next((t for t in tables if t.get("table_id") == self.table_id.get()), None)
+        return match or tables[0]
 
     def draw_empty_table(self) -> None:
         self.table_canvas.delete("all")
@@ -808,6 +879,9 @@ class BlackjackControlPanel(tk.Tk):
             if player.get("is_bot")
         ]
         self.bot_status.set("Bots: " + (", ".join(bot_parts) if bot_parts else "none"))
+
+        self._turn_deadline = table.get("turn_deadline")
+        self._current_player_for_turn = table.get("current_player_id")
 
     def draw_player(self, label: str, details: str, cards: list[str], x: int, y: int, active: bool = False) -> None:
         canvas = self.table_canvas

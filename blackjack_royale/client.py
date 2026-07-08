@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     sub.add_parser("tables")
 
     join = sub.add_parser("join")
-    join.add_argument("--player-id", required=True)
+    join.add_argument("--player-id")
     join.add_argument("--name", required=True)
 
     bot = sub.add_parser("add-bot")
@@ -78,7 +78,10 @@ def to_message(args: argparse.Namespace) -> tuple[str, dict]:
     base = {"table_id": args.table}
     builders = {
         "tables": lambda: ("LIST_TABLES", base),
-        "join": lambda: ("JOIN_TABLE", base | {"player_id": args.player_id, "name": args.name}),
+        "join": lambda: (
+            "JOIN_TABLE",
+            base | ({"player_id": args.player_id} if args.player_id else {}) | {"name": args.name},
+        ),
         "add-bot": lambda: (
             "ADD_BOT",
             base | {"name": args.name, "amount": args.amount} | ({"bot_id": args.bot_id} if args.bot_id else {}),
@@ -111,7 +114,10 @@ async def async_main() -> None:
     if args.host is None:
         args.host = "localhost"
     message_type, payload = to_message(args)
-    print_response(await send(args.host, args.port, message_type, payload))
+    response = await send(args.host, args.port, message_type, payload)
+    if message_type == "JOIN_TABLE" and "player_id" in response:
+        print(f">>> Assigned player_id: {response['player_id']}  (use --player-id {response['player_id']} on future commands)")
+    print_response(response)
 
 
 def main() -> None:
