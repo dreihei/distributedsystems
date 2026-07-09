@@ -28,6 +28,7 @@ class ClusterState:
     client_port: int
     peers: dict[int, Peer] = field(default_factory=dict)
     tables: dict[str, Table] = field(default_factory=dict)
+    turn_timeout: float = 30.0
 
     def local_peer(self) -> Peer:
         return Peer(self.server_id, self.host, self.server_port, self.client_port)
@@ -45,13 +46,26 @@ class ClusterState:
     def ensure_table(self, table_id: str = "main") -> Table:
         table = self.tables.get(table_id)
         if table is None:
-            table = Table(table_id=table_id, game_master_id=self.highest_active_server_id())
+            table = Table(
+                table_id=table_id,
+                game_master_id=self.highest_active_server_id(),
+                turn_timeout=self.turn_timeout,
+            )
             self.tables[table_id] = table
         return table
 
     def apply_snapshot(self, snapshot: dict) -> None:
         table_id = snapshot["table_id"]
         current = self.tables.get(table_id)
-        if current and current.state_version >= snapshot["state_version"]:
+        if current and not self.snapshot_wins(current, snapshot):
             return
         self.tables[table_id] = Table.from_dict(snapshot)
+
+    @staticmethod
+    def snapshot_wins(current: Table, snapshot: dict) -> bool:
+        lineage = snapshot.get("lineage", "legacy")
+        if lineage != current.lineage:
+            # Fork: two tables were created independently under the same id.
+            # The older creation survives everywhere; ties break on lineage.
+            return (snapshot.get("created_at", 0.0), lineage) < (current.created_at, current.lineage)
+        return snapshot["state_version"] > current.state_version

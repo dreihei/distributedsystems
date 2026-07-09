@@ -16,6 +16,7 @@ class RuntimeConfig:
     client_timeout: float = 8.0
     reconnect_window: float = 45.0
     election_timeout: float = 3.0
+    turn_timeout: float = 30.0
 
 
 DEFAULT_CONFIG = RuntimeConfig()

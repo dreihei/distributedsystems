@@ -122,9 +122,15 @@ Wichtige Client-Server-Nachrichten:
 - `ADD_BOT`
 - `PLACE_BET`
 - `START_ROUND`
+- `NEW_ROUND`
 - `HIT`
 - `STAND`
+- `DOUBLE`
+- `SPLIT`
+- `REFILL_BALANCE`
 - `LIST_TABLES`
+
+Die Spielregeln werden serverseitig erzwungen: unzulaessige Aktionen (falsche Phase, Split ohne Paar, Einsatz aendern waehrend der Runde) beantwortet der Server mit einer Fehlermeldung und dem aktuellen Snapshot.
 
 ## Erreichbarkeit ohne feste IP-Adresse
 
