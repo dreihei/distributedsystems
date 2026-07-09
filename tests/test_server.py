@@ -5,6 +5,7 @@ from unittest.mock import patch
 from blackjack_royale.blackjack import Card
 from blackjack_royale.messages import Message
 from blackjack_royale.server import BlackjackServer
+from blackjack_royale.state import Peer
 
 TWO_PLAYER_NON_BLACKJACK_DECK = [
     Card("7", "diamonds"), Card("4", "diamonds"),
@@ -141,6 +142,48 @@ class ServerHandlersTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second["player_id"], player_id)
         self.assertEqual(len(table.players), 1)
         self.assertEqual(table.players[player_id].balance, 750)
+
+    async def test_detect_failed_master_reclaims_for_returning_higher_peer(self) -> None:
+        server = self.make_server()  # id 1
+        table = server.state.ensure_table("main")
+        table.game_master_id = 1
+        server.state.upsert_peer(Peer(2, "127.0.0.1", 9102, 9002))  # higher id, freshly seen
+
+        with patch.object(server, "run_election") as run_election:
+            await server.detect_failed_master()
+
+        run_election.assert_called_once()
+
+    async def test_detect_failed_master_does_not_reelect_when_master_is_highest(self) -> None:
+        server = self.make_server()  # id 1
+        table = server.state.ensure_table("main")
+        table.game_master_id = 1
+        # No peers known -> id 1 is already the highest active id, nothing to do.
+
+        with patch.object(server, "run_election") as run_election:
+            await server.detect_failed_master()
+
+        run_election.assert_not_called()
+
+    async def test_peer_coordinator_rejects_claim_below_known_alive_peer(self) -> None:
+        server = self.make_server()  # id 1
+        server.state.ensure_table("main").game_master_id = 3
+        server.state.upsert_peer(Peer(3, "127.0.0.1", 9103, 9003))  # higher id, alive
+
+        response = await server.peer_coordinator(Message("COORDINATOR", "2", {"server_id": 2}))
+
+        self.assertEqual(response["status"], "REJECTED")
+        self.assertEqual(server.state.tables["main"].game_master_id, 3)
+
+    async def test_peer_coordinator_accepts_claim_from_legitimate_highest(self) -> None:
+        server = self.make_server()  # id 1
+        server.state.ensure_table("main").game_master_id = 1
+        server.state.upsert_peer(Peer(3, "127.0.0.1", 9103, 9003))
+
+        response = await server.peer_coordinator(Message("COORDINATOR", "3", {"server_id": 3}))
+
+        self.assertEqual(response["status"], "COORDINATOR_ACCEPTED")
+        self.assertEqual(server.state.tables["main"].game_master_id, 3)
 
 
 if __name__ == "__main__":

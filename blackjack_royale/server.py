@@ -328,6 +328,15 @@ class BlackjackServer:
 
     async def peer_coordinator(self, message: Message) -> dict:
         new_master = int(message.payload["server_id"])
+        now = time.time()
+        # Reject a stale coordinator claim if we know of a genuinely alive
+        # server with a higher id (it will reclaim via its own election).
+        higher_alive = self.state.server_id > new_master or any(
+            peer.server_id > new_master and now - peer.last_seen <= self.config.heartbeat_timeout
+            for peer in self.state.peers.values()
+        )
+        if higher_alive:
+            return {"status": "REJECTED"}
         for table in self.state.tables.values():
             table.game_master_id = new_master
         self.election_running = False
@@ -372,8 +381,11 @@ class BlackjackServer:
 
     async def send_heartbeats(self) -> None:
         payload = {"peer": self.state.local_peer().__dict__, "tables": self.table_versions()}
-        for peer in list(self.state.peers.values()):
-            response = await self.request(peer.host, peer.server_port, Message("HEARTBEAT", str(self.state.server_id), payload))
+        peers = list(self.state.peers.values())
+        responses = await asyncio.gather(
+            *[self.request(peer.host, peer.server_port, Message("HEARTBEAT", str(self.state.server_id), payload)) for peer in peers]
+        )
+        for peer, response in zip(peers, responses):
             if response:
                 peer.touch()
                 # The response repairs any table we are behind on (anti-entropy).
@@ -391,7 +403,10 @@ class BlackjackServer:
             master = table.game_master_id
             peer = self.state.peers.get(master)
             master_missing = master != self.state.server_id and (peer is None or now - peer.last_seen > self.config.heartbeat_timeout)
-            if master_missing:
+            # A higher-id peer that just recovered outranks the current master
+            # and must reclaim the role, per the bully algorithm.
+            master_outranked = master != self.state.highest_active_server_id()
+            if master_missing or master_outranked:
                 await self.run_election()
 
     async def turn_timer_loop(self) -> None:
